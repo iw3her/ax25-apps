@@ -25,6 +25,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
 #include <time.h>
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
@@ -116,6 +118,69 @@ static inline void invalid_arg(char *c, char *p)
 static inline void missing_arg(char *c)
 {
 	fprintf(stderr, "%s: argument missing\n", c);
+}
+
+static int time_t_from_uintmax(uintmax_t value, time_t *result)
+{
+	time_t converted;
+
+	converted = (time_t) value;
+	if ((time_t) -1 < 0) {
+		if (value > (uintmax_t) INTMAX_MAX ||
+		    (uintmax_t) converted != value)
+			return -1;
+	} else if ((uintmax_t) converted != value) {
+		return -1;
+	}
+
+	*result = converted;
+	return 0;
+}
+
+static int parse_cache_timestamp(const char *text, time_t *result)
+{
+	char *end;
+	uintmax_t value;
+
+	if (text == NULL || *text == '\0')
+		return -1;
+
+	errno = 0;
+	value = strtoumax(text, &end, 16);
+	if (errno == ERANGE || end == text || *end != '\0')
+		return -1;
+
+	return time_t_from_uintmax(value, result);
+}
+
+static int parse_expire_seconds(const char *text, time_t *result)
+{
+	char *end;
+	intmax_t minutes, seconds;
+	time_t converted;
+
+	if (text == NULL || *text == '\0')
+		return -1;
+
+	errno = 0;
+	minutes = strtoimax(text, &end, 10);
+	if (errno == ERANGE || end == text || *end != '\0' ||
+	    minutes < (intmax_t) LONG_MIN || minutes > (intmax_t) LONG_MAX)
+		return -1;
+	if (minutes > INTMAX_MAX / 60 || minutes < INTMAX_MIN / 60)
+		return -1;
+
+	seconds = minutes * 60;
+	converted = (time_t) seconds;
+	if ((time_t) -1 < 0) {
+		if ((intmax_t) converted != seconds)
+			return -1;
+	} else if (seconds < 0 || (uintmax_t) converted != (uintmax_t) seconds) {
+		return -1;
+	}
+
+	*result = converted;
+	return 0;
 }
 
 static int yesno(char *arg)
@@ -573,7 +638,8 @@ void interpret_command(int fd, char *buf)
 		if (config == NULL)
 			return;
 
-		sscanf(time, "%lx", &stamp);
+		if (parse_cache_timestamp(time, &stamp) != 0)
+			return;
 
 		if (!strcmp(arg, "ax25")) {
 			ndigi = 0;
@@ -651,9 +717,7 @@ void interpret_command(int fd, char *buf)
 	} else if (!strcmp(cmd, "expire")) {
 		if (arg == NULL)
 			return;
-		sscanf(arg, "%ld", &stamp);
-		if (stamp != 0) {
-			stamp *= 60;
+		if (parse_expire_seconds(arg, &stamp) == 0 && stamp != 0) {
 			expire_ax25_route(stamp);
 			expire_ip_route(stamp);
 		}

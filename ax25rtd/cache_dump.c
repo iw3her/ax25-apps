@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <inttypes.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/types.h>
@@ -63,8 +64,8 @@ void dump_ip_routes(int fd, int cmd)
 			       (int) (ip & 0x000000FF));
 
 		len +=
-		    sprintf(buf + len, " %-4s %8.8lx %-9s ", dev,
-			    bp->timestamp, ax25_ntoa(&bp->call));
+		    sprintf(buf + len, " %-4s %08" PRIxMAX " %-9s ", dev,
+			    (uintmax_t) bp->timestamp, ax25_ntoa(&bp->call));
 		if (bp->invalid)
 			len += sprintf(buf + len, "X\n");
 		else
@@ -101,8 +102,9 @@ void dump_ax25_routes(int fd, int cmd)
 		}
 
 		len +=
-		    sprintf(buf + len, "%-9s %-4s %8.8lx",
-			    ax25_ntoa(&bp->call), dev, bp->timestamp);
+		    sprintf(buf + len, "%-9s %-4s %08" PRIxMAX,
+			    ax25_ntoa(&bp->call), dev,
+			    (uintmax_t) bp->timestamp);
 
 		for (k = 0; k < bp->ndigi; k++)
 			len +=
