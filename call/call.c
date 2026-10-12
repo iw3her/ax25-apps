@@ -46,6 +46,7 @@
 #include <locale.h>
 #include <iconv.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 
 #include <netax25/ax25.h>
 #include <netrom/netrom.h>
@@ -108,6 +109,8 @@ typedef struct {
 	int dwn_file;
 	int file_crc;
 	int calc_crc;
+	unsigned long dwn_total;
+	int dwn_active;
 	struct utimbuf ut;
 	int new_header;
 } t_gp;
@@ -467,6 +470,192 @@ static void convert_lf_cr(char *buf, int len)
 			*buf = '\r';
 		buf++;
 	}
+}
+
+static int parse_autobin_ulong(const char *field, size_t length, int base,
+		unsigned long *value)
+{
+	char text[64];
+	char *end;
+	unsigned long parsed;
+	size_t i;
+
+	if (length == 0 || length >= sizeof(text) ||
+		(field[0] == '-' || field[0] == '+'))
+		return -1;
+	for (i = 0; i < length; i++)
+		if (field[i] == '\0' || isspace((unsigned char)field[i]))
+			return -1;
+	memcpy(text, field, length);
+	text[length] = '\0';
+	errno = 0;
+	parsed = strtoul(text, &end, base);
+	if (errno == ERANGE || end == text || *end != '\0')
+		return -1;
+	*value = parsed;
+	return 0;
+}
+
+static int open_autobin_file(const char *name, char *path, size_t path_size)
+{
+	const char *dot = strrchr(name, '.');
+	size_t stem_length = dot != NULL && dot != name ?
+		(size_t)(dot - name) : strlen(name);
+	const char *extension = dot != NULL && dot != name ? dot : "";
+	unsigned int suffix;
+	int fd;
+	int length;
+
+	for (suffix = 0; suffix < 1000000U; suffix++) {
+		if (suffix == 0)
+			length = snprintf(path, path_size, "%s%s", STD_DWN_DIR, name);
+		else
+			length = snprintf(path, path_size, "%s%.*s_%u%s",
+				STD_DWN_DIR, (int)stem_length, name, suffix, extension);
+		if (length < 0 || (size_t)length >= path_size)
+			return -2;
+		fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0666);
+		if (fd != -1)
+			return fd;
+		if (errno != EEXIST)
+			return -1;
+	}
+	return -2;
+}
+
+static void abort_upload_resources(int mode, int *uploadfile, int *binup,
+	int *autobin, WINDOW **swin, wint *wintab)
+{
+	if (*uploadfile != -1) {
+		close(*uploadfile);
+		*uploadfile = -1;
+	}
+	*binup = FALSE;
+	*autobin = FALSE;
+	if (mode != RAWMODE) {
+		if (*swin != NULL)
+			delwin(*swin);
+		*swin = NULL;
+		winclose(wintab);
+	} else {
+		printf("\n");
+		fflush(stdout);
+	}
+}
+
+static void reset_download_resources(int mode, WINDOW **swin, wint *wintab,
+	t_gp *gp)
+{
+	if (gp->dwn_file != -1) {
+		close(gp->dwn_file);
+		gp->dwn_file = -1;
+	}
+	gp->dwn_cnt = 0;
+	gp->dwn_total = 0;
+	gp->dwn_active = FALSE;
+	gp->file_name[0] = '\0';
+	if (mode != RAWMODE) {
+		if (*swin != NULL)
+			delwin(*swin);
+		*swin = NULL;
+		winclose(wintab);
+	} else {
+		printf("\n");
+		fflush(stdout);
+	}
+}
+
+static int write_full_retry(int fd, const void *buffer, size_t length)
+{
+	const char *data = buffer;
+	const time_t timeout_seconds = 60;
+	struct timespec deadline;
+	struct timespec now;
+	struct pollfd pfd;
+	ssize_t written;
+	int poll_timeout;
+	int poll_result;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
+		return -1;
+	deadline = now;
+	deadline.tv_sec += timeout_seconds;
+	pfd.fd = fd;
+	pfd.events = POLLOUT;
+	pfd.revents = 0;
+
+	while (TRUE) {
+		if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
+			return -1;
+		if (now.tv_sec > deadline.tv_sec ||
+			(now.tv_sec == deadline.tv_sec &&
+			 now.tv_nsec >= deadline.tv_nsec)) {
+			errno = ETIMEDOUT;
+			return -1;
+		}
+
+		written = write(fd, data, length);
+		if (written == (ssize_t)length)
+			return 0;
+		if (written > 0) {
+			errno = EIO;
+			return -1;
+		}
+		if (written == 0) {
+			errno = EIO;
+			return -1;
+		}
+		if (errno == EINTR)
+			continue;
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+			return -1;
+
+		poll_timeout = (int)((deadline.tv_sec - now.tv_sec) * 1000 +
+			(deadline.tv_nsec - now.tv_nsec + 999999) / 1000000);
+		if (poll_timeout <= 0) {
+			errno = ETIMEDOUT;
+			return -1;
+		}
+		poll_result = poll(&pfd, 1, poll_timeout);
+		if (poll_result == -1) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (poll_result == 0) {
+			errno = ETIMEDOUT;
+			return -1;
+		}
+		if (pfd.revents & POLLNVAL) {
+			errno = EBADF;
+			return -1;
+		}
+		if (pfd.revents & (POLLERR | POLLHUP)) {
+			errno = EPIPE;
+			return -1;
+		}
+	}
+}
+
+static int write_file_full(int fd, const void *buffer, size_t length)
+{
+	const char *data = buffer;
+	size_t offset = 0;
+	ssize_t written;
+
+	while (offset < length) {
+		written = write(fd, data + offset, length - offset);
+		if (written > 0) {
+			offset += (size_t)written;
+			continue;
+		}
+		if (written == -1 && errno == EINTR)
+			continue;
+		if (written == 0)
+			errno = EIO;
+		return -1;
+	}
+	return 0;
 }
 
 static void convert_upper_lower(char *buf, int len)
@@ -910,257 +1099,327 @@ static void dupdstatw(WINDOW * win, char *s, int add)
 }
 
 static int start_ab_download(int mode, WINDOW ** swin, wint * wintab,
-		      char parms[], int parmsbytes, char buf[], int bytes,
+		      char parms[], int parmsbytes, char buf[], int *bytes,
 		      t_gp * gp, char *address[])
 {
-	int crcst;		/* startposition crc-field  */
-	int datest = 0;		/* startposition date-field */
-	int namest = 0;		/* startposition name-field */
-	int cnt;
-	int date = 0;
+	unsigned int date = 0;
 	struct tm ft;
 	char s[GP_FILENAME_SIZE + 18];
+	char name[GP_FILENAME_SIZE];
+	char path[GP_FILENAME_SIZE];
+	const char *end;
+	const char *sep1;
+	const char *sep2;
+	const char *sep3;
+	const char *name_start;
+	const char *slash;
+	unsigned long parsed;
+	size_t name_length;
+	size_t accepted;
+	size_t extra;
+	unsigned long offset;
+	size_t i;
+	int ret;
+	int name_result;
 	int time_set = 0;
 
-	for (crcst = 2; crcst < parmsbytes - 1 &&
-		(!(parms[crcst - 2] == '#' && parms[crcst - 1] == '|')); crcst++);
-
-	if (crcst < parmsbytes - 1) {
-		gp->file_crc = atoi(parms + crcst);
-
-		for (datest = crcst; datest < parmsbytes - 1 &&
-			(!(parms[datest - 2] == '#' && parms[datest - 1] == '$'));
-		     datest++);
-
-		if (datest < parmsbytes -1) {
-		  date = (int) strtol(parms + datest, NULL, 16);
-		  ft.tm_sec = (date & 0x1F) * 2;
-		  date >>= 5;
-		  ft.tm_min = date & 0x3F;
-		  date >>= 6;
-		  ft.tm_hour = date & 0x1F;
-		  date >>= 5;
-		  ft.tm_mday = date & 0x1F;
-		  date >>= 5;
-		  ft.tm_mon = (date & 0x0F) -1;
-		  date >>= 4;
-		  ft.tm_year = (date & 0x7F) + 80;
-		  ft.tm_isdst = -1;
-		  ft.tm_yday = -1;
-		  ft.tm_wday = -1;
-		  gp->ut.actime = mktime(&ft);
-		  gp->ut.modtime = gp->ut.actime;
-		  time_set = 1;
-		} else {
-		  datest = crcst + 1;
-		}
-
-		for (namest = datest; namest < parmsbytes - 1 &&
-			(parms[namest - 1] != '#'); namest++);
+	if (parmsbytes <= 0)
+		goto bad_autobin_header;
+	end = parms + parmsbytes;
+	if (end > parms && end[-1] == '\r')
+		end--;
+	if (end == parms)
+		goto bad_autobin_header;
+	sep1 = memchr(parms, '#', (size_t)(end - parms));
+	if (sep1 == NULL) {
+		if (parse_autobin_ulong(parms, (size_t)(end - parms), 10,
+				&gp->dwn_cnt) == -1)
+			goto bad_autobin_header;
+		gp->new_header = FALSE;
+		name_result = snprintf(name, sizeof(name), "%s.dwnfile", address[0]);
+		if (name_result < 0 || (size_t)name_result >= sizeof(name))
+			goto bad_autobin_header;
+	} else {
+		if (sep1 == parms || sep1 + 1 >= end || sep1[1] != '|')
+			goto bad_autobin_header;
+		sep2 = memchr(sep1 + 2, '#', (size_t)(end - (sep1 + 2)));
+		if (sep2 == NULL || sep2 + 1 >= end || sep2[1] != '$')
+			goto bad_autobin_header;
+		sep3 = memchr(sep2 + 2, '#', (size_t)(end - (sep2 + 2)));
+		if (sep3 == NULL || sep3 == sep2 + 2)
+			goto bad_autobin_header;
+		if (parse_autobin_ulong(parms, (size_t)(sep1 - parms), 10,
+				&gp->dwn_cnt) == -1)
+			goto bad_autobin_header;
+		if (parse_autobin_ulong(sep1 + 2,
+				(size_t)(sep2 - (sep1 + 2)), 10, &parsed) == -1 ||
+			parsed > 0xffffU)
+			goto bad_autobin_header;
+		gp->file_crc = (int)parsed;
+		if (parse_autobin_ulong(sep2 + 2,
+				(size_t)(sep3 - (sep2 + 2)), 16, &parsed) == -1 ||
+			parsed > UINT_MAX)
+			goto bad_autobin_header;
+		date = (unsigned int)parsed;
+		ft.tm_sec = (date & 0x1F) * 2;
+		date >>= 5;
+		ft.tm_min = date & 0x3F;
+		date >>= 6;
+		ft.tm_hour = date & 0x1F;
+		date >>= 5;
+		ft.tm_mday = date & 0x1F;
+		date >>= 5;
+		ft.tm_mon = (date & 0x0F) - 1;
+		date >>= 4;
+		ft.tm_year = (date & 0x7F) + 80;
+		ft.tm_isdst = -1;
+		ft.tm_yday = -1;
+		ft.tm_wday = -1;
+		gp->ut.actime = mktime(&ft);
+		gp->ut.modtime = gp->ut.actime;
+		time_set = 1;
+		gp->new_header = TRUE;
+		name_start = sep3 + 1;
+		name_length = (size_t)(end - name_start);
+		if (name_length == 0)
+			goto bad_autobin_header;
+		slash = name_start + name_length;
+		while (slash != name_start && slash[-1] != '/' && slash[-1] != '\\')
+			slash--;
+		name_start = slash;
+		if (*name_start == '/' || *name_start == '\\')
+			name_start++;
+		name_length = (size_t)(end - name_start);
+		if (name_length == 0 || name_length >= sizeof(name))
+			goto bad_autobin_header;
+		memcpy(name, name_start, name_length);
+		name[name_length] = '\0';
+		if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
+			strpbrk(name, "\r\n") != NULL)
+			goto bad_autobin_header;
 	}
+	name_length = strlen(name);
+	for (i = 0; i < name_length; i++)
+		if (iscntrl((unsigned char)name[i]))
+			goto bad_autobin_header;
 
 	if (!time_set) {
-		time_t t = time(NULL);
-		memcpy(&ft, localtime(&t), sizeof(struct tm));
-		gp->ut.actime = mktime(localtime(&t));
+		time_t current = time(NULL);
+		struct tm *local = localtime(&current);
+
+		if (local == NULL)
+			goto bad_autobin_header;
+		memcpy(&ft, local, sizeof(ft));
+		gp->ut.actime = mktime(&ft);
 		gp->ut.modtime = gp->ut.actime;
 	}
-
-	gp->dwn_cnt = (unsigned long ) atol(parms);
-	strncpy(gp->file_name, STD_DWN_DIR, GP_FILENAME_SIZE-1);
-	gp->file_name[GP_FILENAME_SIZE-1] = 0;
-
-	if (crcst == parmsbytes - 1 || datest - crcst > 7
-	    || namest - datest > 10) {
-		*swin =
-		    opnstatw(mode, wintab,
-			     "Remote starts AutoBin transfer", 6, 52);
-		gp->new_header = FALSE;
-		wrdstatw(*swin, "old styled Header (no filename)");
-		if (strlen(gp->file_name) + strlen(address[0]) < GP_FILENAME_SIZE -1)
-		  strcat(gp->file_name, address[0]);
-		else
-		  return -1;
-		if (strlen(gp->file_name) + strlen(".dwnfile") < GP_FILENAME_SIZE -1)
-		  strcat(gp->file_name, ".dwnfile");
-		else
-		  return -1;
-	} else {
-		int len;
-		gp->new_header = TRUE;
-		for (cnt = parmsbytes - namest;
-		     cnt > 0 && !(parms[cnt + namest - 1] == '\\'
-		       || parms[cnt + namest - 1] == '/');
-		     cnt--);
-		len = parmsbytes - namest - cnt;
-		if (len < 1)
-			return -1;
-		if (len > sizeof(s) -1)
-			len = sizeof(s) -1;
-		strncpy(s, &parms[namest + cnt], len);
-		s[len] = 0;
-		if (*s == '\r')
-			return -1;
-		/* convert_upper_lower(s, len); */
-		if (strlen(gp->file_name) + len < GP_FILENAME_SIZE - 1)
-		  strcat(gp->file_name, s);
-		else
-		  return -1;
-
-		*swin =
-		    opnstatw(mode, wintab,
-			     "Remote starts AutoBin transfer", 10, 52);
-
-		sprintf(s, "size of file    : %lu",
-			(unsigned long) gp->dwn_cnt);
-		wrdstatw(*swin, s);
-		snprintf(s, sizeof(s), "filename        : %s", gp->file_name);
-		wrdstatw(*swin, s);
-		sprintf(s, "last mod. date  : %02i.%02i.%04i", ft.tm_mday,
-			ft.tm_mon+1 , ft.tm_year + 1900);
-		wrdstatw(*swin, s);
-		sprintf(s, "last mod. time  : %02i:%02i:%02i", ft.tm_hour,
-			ft.tm_min, ft.tm_sec);
-		wrdstatw(*swin, s);
+	if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
+		name[0] == '\0')
+		goto bad_autobin_header;
+	gp->dwn_total = gp->dwn_cnt;
+	gp->dwn_file = open_autobin_file(name, path, sizeof(path));
+	if (gp->dwn_file >= 0) {
+		if (strlen(path) >= sizeof(gp->file_name)) {
+			close(gp->dwn_file);
+			gp->dwn_file = -1;
+			goto bad_autobin_header;
+		}
+		strcpy(gp->file_name, path);
 	}
-
-	dupdstatw(*swin, "Bytes to receive: ", TRUE);
-
-	gp->dwn_file = open(gp->file_name, O_RDWR | O_CREAT, 0666);
+	if (gp->dwn_file == -2) {
+		statline(mode, "AutoBin filename is too long or has too many collisions");
+		*bytes = 0;
+		return -1;
+	}
 	if (gp->dwn_file == -1) {
+		if (path[0] != '\0' && strlen(path) < sizeof(gp->file_name))
+			strcpy(gp->file_name, path);
 		snprintf(s, sizeof(s), "Unable to open %s", gp->file_name);
 		statline(mode, s);
-		if (write(fd, "#ABORT#\r", 8) == -1) {
+		if (write_full_retry(fd, "#ABORT#\r", 8) == -1) {
 			perror("write");
 		}
 		gp->dwn_cnt = 0;
+		gp->dwn_total = 0;
+		gp->dwn_active = FALSE;
 		gp->file_name[0] = '\0';
+		*bytes = 0;
 		return -1;
 	}
-	if (bytes == 1) {
-		if (write(fd, "#OK#\r", 5) == -1) {
+	gp->dwn_active = TRUE;
+	*swin = opnstatw(mode, wintab, "Remote starts AutoBin transfer",
+		gp->new_header ? 10 : 6, 52);
+	if (!gp->new_header)
+		wrdstatw(*swin, "old styled Header (no filename)");
+	snprintf(s, sizeof(s), "size of file    : %lu", gp->dwn_total);
+	wrdstatw(*swin, s);
+	snprintf(s, sizeof(s), "filename        : %s", gp->file_name);
+	wrdstatw(*swin, s);
+	snprintf(s, sizeof(s), "last mod. date  : %02i.%02i.%04i", ft.tm_mday,
+		ft.tm_mon + 1, ft.tm_year + 1900);
+	wrdstatw(*swin, s);
+	snprintf(s, sizeof(s), "last mod. time  : %02i:%02i:%02i", ft.tm_hour,
+		ft.tm_min, ft.tm_sec);
+	wrdstatw(*swin, s);
+	dupdstatw(*swin, "Bytes to receive: ", TRUE);
+	gp->calc_crc = 0;
+	if (*bytes == 1) {
+		if (write_full_retry(fd, "#OK#\r", 5) == -1) {
 			perror("write");
-			close(gp->dwn_file);
-			gp->dwn_file = -1;
-			gp->dwn_cnt = 0;
-			gp->file_name[0] = '\0';
+			snprintf(s, sizeof(s), "ERROR: unable to acknowledge %s",
+				gp->file_name);
+			*bytes = 0;
+			statline(mode, s);
+			reset_download_resources(mode, swin, wintab, gp);
 			return -1;
 		}
-		gp->calc_crc = 0;
+		*bytes = 0;
 	} else {
-		unsigned long offset = 0L;
-		while (offset != bytes) {
-			int ret = write(gp->dwn_file, buf+offset, bytes-offset);
+		accepted = *bytes;
+		if (accepted > gp->dwn_cnt)
+			accepted = gp->dwn_cnt;
+		extra = (size_t)*bytes - accepted;
+		offset = 0;
+		while (offset < accepted) {
+			ret = write(gp->dwn_file, buf + offset, accepted - offset);
 			if (ret == -1) {
-				perror("write");
 				if (errno == EWOULDBLOCK || errno == EAGAIN) {
 					usleep(100000);
 					continue;
 				}
-				close(gp->dwn_file);
-				gp->dwn_file = -1;
-				gp->dwn_cnt = 0;
-				gp->file_name[0] = '\0';
+				perror("write");
+				snprintf(s, sizeof(s),
+					"ERROR: write failed; preserved %s",
+					gp->file_name);
+				statline(mode, s);
+				*bytes = 0;
+				reset_download_resources(mode, swin, wintab, gp);
 				return -1;
 			}
 			if (ret == 0) {
-				close(gp->dwn_file);
-				gp->dwn_file = -1;
-				gp->dwn_cnt = 0;
-				gp->file_name[0] = '\0';
+				snprintf(s, sizeof(s),
+					"ERROR: zero-length write; preserved %s",
+					gp->file_name);
+				statline(mode, s);
+				*bytes = 0;
+				reset_download_resources(mode, swin, wintab, gp);
 				return -1;
-				break;
 			}
-			gp->calc_crc = calc_crc((unsigned char *) buf, ret, 0);
+			gp->calc_crc = calc_crc((unsigned char *) buf + offset,
+				ret, gp->calc_crc);
 			gp->dwn_cnt -= ret;
 			offset += ret;
 		}
+		if (extra != 0)
+			memmove(buf, buf + accepted, extra);
+		*bytes = (int)extra;
 	}
-
+	if (gp->dwn_cnt == 0) {
+		if (gp->new_header && gp->calc_crc != gp->file_crc)
+			snprintf(s, sizeof(s),
+				"ERROR: CRC failed for %s (received %lu bytes)",
+				gp->file_name, gp->dwn_total);
+		else
+			snprintf(s, sizeof(s), "AutoBin complete: %s", gp->file_name);
+		statline(mode, s);
+		utime(gp->file_name, &gp->ut);
+		reset_download_resources(mode, swin, wintab, gp);
+	}
 	return 0;
+
+bad_autobin_header:
+	if (gp->dwn_file != -1) {
+		close(gp->dwn_file);
+		gp->dwn_file = -1;
+	}
+	gp->dwn_cnt = 0;
+	gp->dwn_total = 0;
+	gp->dwn_active = FALSE;
+	gp->file_name[0] = '\0';
+	statline(mode, "ERROR: invalid AutoBin header");
+	*bytes = 0;
+	return -1;
 }
 
-static int ab_down(int mode, WINDOW * swin, wint * wintab, char buf[],
+static int ab_down(int mode, WINDOW ** swin, wint * wintab, char buf[],
 	int *bytes, t_gp * gp)
 {
-	unsigned long extrach = 0;
-	char s[80];
+	size_t expected;
+	size_t accepted;
+	size_t extra;
+	size_t offset = 0;
+	ssize_t written;
+	char s[GP_FILENAME_SIZE + 40];
 
 	if (*bytes == 8 && strncmp(buf, "#ABORT#\r", 8) == 0) {
-		gp->dwn_cnt = 0;
-		close(gp->dwn_file);
-		gp->dwn_file = -1;
-		statline(mode, "Remote aborts AutoBin transfer!");
-		gp->file_name[0] = '\0';
+		snprintf(s, sizeof(s), "ERROR: remote abort; preserved %s",
+			gp->file_name);
+		statline(mode, s);
 		*bytes = 0;
-		if (mode != RAWMODE) {
-			delwin(swin);
-			winclose(wintab);
-		} else {
-			printf("\n");
-			fflush(stdout);
-		}
-
+		reset_download_resources(mode, swin, wintab, gp);
 		return 0;
 	}
-	if (gp->dwn_cnt < *bytes) {
-		extrach = *bytes - gp->dwn_cnt;
-		*bytes = gp->dwn_cnt;
-	}
-	if (write(gp->dwn_file, buf, *bytes) != *bytes) {
-		close(gp->dwn_file);
-		gp->dwn_file = -1;
-		gp->dwn_cnt = 0;
-		gp->file_name[0] = '\0';
-		statline(mode,
-			 "Error while writing download file. Download aborted.");
-
-		if (mode != RAWMODE) {
-			delwin(swin);
-			winclose(wintab);
-		} else {
-			printf("\n");
-			fflush(stdout);
-		}
-	} else {
-		gp->calc_crc = calc_crc((unsigned char *) buf, *bytes, gp->calc_crc);
-		gp->dwn_cnt -= *bytes;
-
-		if (gp->dwn_cnt == 0) {
-			if (mode != RAWMODE) {
-				delwin(swin);
-				winclose(wintab);
-			} else {
-				printf("\n");
-				fflush(stdout);
+	if (*bytes <= 0 || gp->dwn_file == -1)
+		return -1;
+	expected = (size_t)*bytes;
+	if (gp->dwn_cnt < expected)
+		accepted = gp->dwn_cnt;
+	else
+		accepted = expected;
+	extra = expected - accepted;
+	while (offset < accepted) {
+		written = write(gp->dwn_file, buf + offset, accepted - offset);
+		if (written == -1) {
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+				if (errno != EINTR)
+					usleep(100000);
+				continue;
 			}
-
-			strcpy(s, "AutoBin download finished ");
-			if (gp->new_header)
-				if (gp->calc_crc == gp->file_crc)
-					strcat(s, "CRC check ok");
-				else {
-					strcat(s, "CRC check failed!");
-			} else {
-				sprintf(s + strlen(s), "CRC=%u",
-					gp->calc_crc);
-			}
+			perror("write");
+			snprintf(s, sizeof(s),
+				"ERROR: write failed; preserved %s (%lu/%lu bytes)",
+				gp->file_name, gp->dwn_total - gp->dwn_cnt,
+				gp->dwn_total);
 			statline(mode, s);
-			close(gp->dwn_file);
-			gp->dwn_file = -1;
-			utime(gp->file_name, &gp->ut);
-			gp->file_name[0] = '\0';
-			if (extrach != 0) {
-				memmove(buf, buf + *bytes, extrach);
-				*bytes = extrach;
-			} else
-				*bytes = 0;
-		} else {
-			sprintf(s, "%u", (unsigned int) gp->dwn_cnt);
-			dupdstatw(swin, s, FALSE);
 			*bytes = 0;
+			reset_download_resources(mode, swin, wintab, gp);
+			return -1;
 		}
+		if (written == 0) {
+			errno = EIO;
+			perror("write");
+			snprintf(s, sizeof(s),
+				"ERROR: zero-length write; preserved %s (%lu/%lu bytes)",
+				gp->file_name, gp->dwn_total - gp->dwn_cnt,
+				gp->dwn_total);
+			statline(mode, s);
+			*bytes = 0;
+			reset_download_resources(mode, swin, wintab, gp);
+			return -1;
+		}
+		gp->calc_crc = calc_crc((unsigned char *)buf + offset,
+			(int)written, gp->calc_crc);
+		gp->dwn_cnt -= (unsigned long)written;
+		offset += (size_t)written;
 	}
+	if (extra != 0)
+		memmove(buf, buf + accepted, extra);
+	*bytes = (int)extra;
+	if (gp->dwn_cnt != 0) {
+		snprintf(s, sizeof(s), "%lu", gp->dwn_cnt);
+		dupdstatw(*swin, s, FALSE);
+		*bytes = 0;
+		return 0;
+	}
+	if (gp->new_header && gp->calc_crc != gp->file_crc)
+		snprintf(s, sizeof(s),
+			"ERROR: CRC failed; preserved %s (%lu bytes)",
+			gp->file_name, gp->dwn_total);
+	else
+		snprintf(s, sizeof(s), "AutoBin complete: %s", gp->file_name);
+	statline(mode, s);
+	utime(gp->file_name, &gp->ut);
+	reset_download_resources(mode, swin, wintab, gp);
 	return 0;
 }
 
@@ -2071,11 +2330,19 @@ static int cmd_call(char *call[], int mode, int encoding)
 	int uploadfile = -1;
 	int downloadfile = -1;
 	int binup = FALSE;
+	int autobin = FALSE;
 	unsigned long uplsize = 0;
 	unsigned long uplpos = 0;
 	char uplbuf[128];	/* Upload buffer */
 	int upldp = 0;
 	int upllen = 0;
+	off_t measured_size;
+	size_t upload_requested;
+	unsigned long upload_remaining;
+	unsigned long upload_start;
+	ssize_t upload_written;
+	unsigned int tx_crc = 0;
+	const char *upload_error_message = NULL;
 	char *c, *t;
 	t_gp gp;
 	t_win win_in = {
@@ -2098,6 +2365,10 @@ static int cmd_call(char *call[], int mode, int encoding)
 		paclen = sizeof(buf);
 
 	gp.dwn_cnt = 0;
+	gp.dwn_file = -1;
+	gp.dwn_total = 0;
+	gp.dwn_active = FALSE;
+	gp.file_name[0] = '\0';
 	wintab.next = NULL;
 
 	fd = connect_to(call);
@@ -2197,6 +2468,8 @@ static int cmd_call(char *call[], int mode, int encoding)
 				break;
 			}
 			if (bytes == -1) {
+				if (errno == EINTR)
+					continue;
 				if (errno == EWOULDBLOCK || errno == EAGAIN) {
 					usleep(100000);
 					continue;
@@ -2205,8 +2478,8 @@ static int cmd_call(char *call[], int mode, int encoding)
 					perror("read");
 				break;
 			}
-			if (gp.dwn_cnt != 0) {
-				ab_down(mode, swin, &wintab, buf, &bytes,
+			if (gp.dwn_active) {
+				ab_down(mode, &swin, &wintab, buf, &bytes,
 					&gp);
 				if (bytes == 0) {
 					continue;
@@ -2234,9 +2507,7 @@ static int cmd_call(char *call[], int mode, int encoding)
 						dupdstatw(swin, s, FALSE);
 					}
 					if (downloadfile != -1) {
-						if (write
-						    (downloadfile, buf,
-						     bytes) != bytes) {
+						if (write_file_full(downloadfile, buf, bytes) == -1) {
 							close
 							    (downloadfile);
 							downloadfile = -1;
@@ -2278,10 +2549,9 @@ static int cmd_call(char *call[], int mode, int encoding)
 								  parms,
 								  parmsbytes,
 								  restbuf,
-								  restbytes,
+										  &restbytes,
 								  &gp,
 								  call);
-						restbytes = 0;
 					}
 					break;
 				case 2:
@@ -2478,37 +2748,45 @@ static int cmd_call(char *call[], int mode, int encoding)
 						restorecursor(mode, &win_out);
 						continue;
 					}
-					if (lseek(uploadfile, 0L, SEEK_END)
-							!= -1)
-						uplsize =
-							lseek(uploadfile, 0L,
-									SEEK_CUR);
-					else
-						uplsize = 0;
-					lseek(uploadfile, 0L, SEEK_SET);
+					measured_size = lseek(uploadfile, 0L, SEEK_END);
+					if (measured_size < 0 || measured_size > LONG_MAX) {
+						close(uploadfile);
+						uploadfile = -1;
+						binup = FALSE;
+						autobin = FALSE;
+						statline(mode,
+							"Upload file size is not supported");
+						restorecursor(mode, &win_out);
+						continue;
+					}
+					if (lseek(uploadfile, 0L, SEEK_SET) == -1) {
+						close(uploadfile);
+						uploadfile = -1;
+						binup = FALSE;
+						autobin = FALSE;
+						statline(mode,
+							"Unable to seek upload file");
+						restorecursor(mode, &win_out);
+						continue;
+					}
+					uplsize = (unsigned long) measured_size;
 					uplpos = 0;
 					upldp = -1;
 					upllen = 0;
-					if (uplsize != -1) {
-						sprintf(s,
-								"Uploading %ld bytes from %s",
+					binup = FALSE;
+					autobin = FALSE;
+					{
+						int status_length;
+
+						status_length = snprintf(s, sizeof(s),
+								"Uploading %lu bytes from %s",
 								uplsize, t);
-						swin =
-							opnstatw(mode, &wintab,
-									s, 6, 50);
-						dupdstatw(swin,
-								"bytes sent   : ",
-								TRUE);
-					} else {
-						sprintf(s,
-								"Uploading from %s",
-								t);
-						swin =
-							opnstatw(mode, &wintab,
-									s, 6, 50);
-						dupdstatw(swin,
-								"bytes sent   : ",
-								TRUE);
+						if (status_length < 0 ||
+							(size_t)status_length >= sizeof(s))
+							snprintf(s, sizeof(s),
+								"Uploading: filename too long");
+						swin = opnstatw(mode, &wintab, s, 6, 50);
+						dupdstatw(swin, "bytes sent   : ", TRUE);
 					}
 					switch (buf[1]) {
 					case 'a':
@@ -2516,8 +2794,15 @@ static int cmd_call(char *call[], int mode, int encoding)
 						{
 							struct stat statbuf;
 							time_t file_time = 0L;
+							int bin_header_length;
+							size_t bin_header_size;
+							char *bin_header = NULL;
+							const char *bin_date;
+							const char *bin_error_message = NULL;
 							binup = TRUE;
+							autobin = TRUE;
 							crc = 0;
+							tx_crc = 0;
 							if (!fstat(uploadfile, &statbuf))
 								file_time =  statbuf.st_mtime;
 							else
@@ -2533,22 +2818,9 @@ static int cmd_call(char *call[], int mode, int encoding)
 								if (upllen
 										==
 										-1) {
-									close
-										(uploadfile);
-									uploadfile
-										=
-										-1;
-									delwin
-										(swin);
-									winclose
-										(&wintab);
-									sprintf
-										(s,
-										 "Error reading upload file: upload aborted");
-									statline
-										(mode,
-										 s);
-									break;
+									bin_error_message =
+										"Error reading upload file: upload aborted";
+									goto bin_header_abort;
 								}
 								crc =
 									calc_crc
@@ -2556,33 +2828,63 @@ static int cmd_call(char *call[], int mode, int encoding)
 									 upllen,
 									 crc);
 							} while (upllen > 0);
-							lseek(uploadfile,
-									0L,
-									SEEK_SET);
-							sprintf(s,
-									"#BIN#%ld#|%u#$%s#%s\r",
-									uplsize,
-									crc,
-									unix_to_sfbin_date_string(file_time),
-									t);
-							if ( write(fd, s,
-										strlen(s)) != strlen(s)) {
-								perror("write");
-								exit(1);
+							if (lseek(uploadfile, 0L, SEEK_SET) == -1) {
+								bin_error_message =
+									"Unable to seek upload file";
+								goto bin_header_abort;
 							}
+							bin_date =
+								unix_to_sfbin_date_string(file_time);
+							bin_header_length = snprintf(NULL, 0,
+									"#BIN#%lu#|%u#$%s#%s\r",
+									uplsize, crc, bin_date, t);
+							if (bin_header_length < 0)
+								goto bin_header_abort;
+							bin_header_size =
+								(size_t)bin_header_length + 1;
+							if (bin_header_size == 0)
+								goto bin_header_abort;
+							bin_header = malloc(bin_header_size);
+							if (bin_header == NULL)
+								goto bin_header_abort;
+							if (snprintf(bin_header, bin_header_size,
+									"#BIN#%lu#|%u#$%s#%s\r",
+									uplsize, crc, bin_date, t) !=
+								bin_header_length)
+								goto bin_header_abort;
+			if (write_full_retry(fd, bin_header,
+					bin_header_size - 1) == -1) {
+								bin_error_message =
+									"AutoBin header write failed";
+								perror("write");
+								goto bin_header_abort;
+							}
+							free(bin_header);
 							uplpos = 0;
 							upldp = -1;
 							upllen = 0;
+							goto bin_header_done;
+					bin_header_abort:
+							free(bin_header);
+							abort_upload_resources(mode, &uploadfile, &binup,
+								&autobin, &swin, &wintab);
+							if (bin_error_message == NULL)
+								bin_error_message =
+									"AutoBin upload aborted: header error";
+							statline(mode, bin_error_message);
+					bin_header_done:
 						}
 						restorecursor(mode, &win_out);
 						break;
 					case 'b':
 					case 'B':
 						binup = TRUE;
+						autobin = FALSE;
 						break;
 					case 'u':
 					case 'U':
 						binup = FALSE;
+						autobin = FALSE;
 					}
 					continue;
 				case 'O':
@@ -2607,9 +2909,14 @@ static int cmd_call(char *call[], int mode, int encoding)
 								open(t,
 									O_RDWR | O_APPEND |
 									O_CREAT, 0666)) == -1) {
-						sprintf(s,
-								"Unable to open %s",
-								buf + 2);
+						int status_length;
+
+						status_length = snprintf(s, sizeof(s),
+								"Unable to open %s", buf + 2);
+						if (status_length < 0 ||
+							(size_t)status_length >= sizeof(s))
+							snprintf(s, sizeof(s),
+								"Unable to open: filename too long");
 						statline(mode, s);
 					} else
 						statbits(mode, 'L', 1);
@@ -2720,9 +3027,11 @@ static int cmd_call(char *call[], int mode, int encoding)
 				break;
 		}
 		if (uploadfile != -1) {
-			if (uplsize == 0) {
+			if (uplsize == 0 && !autobin) {
 				close(uploadfile);
 				uploadfile = -1;
+				binup = FALSE;
+				autobin = FALSE;
 				delwin(swin);
 				winclose(&wintab);
 				statline(mode,
@@ -2735,24 +3044,53 @@ static int cmd_call(char *call[], int mode, int encoding)
 				    read(uploadfile, uplbuf, 128);
 
 				if (upllen == 0) {
+					if (autobin) {
+						struct stat current_stat;
+
+						if (uplpos != uplsize) {
+							upload_error_message =
+								"AutoBin upload aborted: premature EOF";
+							goto upload_data_abort;
+						}
+						if (fstat(uploadfile, &current_stat) == -1 ||
+							current_stat.st_size != (off_t)uplsize) {
+							upload_error_message =
+								"AutoBin upload aborted: file changed";
+							goto upload_data_abort;
+						}
+						if (tx_crc != (unsigned int)crc) {
+							upload_error_message =
+								"AutoBin upload aborted: CRC mismatch";
+							goto upload_data_abort;
+						}
+					}
 					close(uploadfile);
 					uploadfile = -1;
+					binup = FALSE;
+					autobin = FALSE;
 					delwin(swin);
 					winclose(&wintab);
 					sprintf(s,
-						"Upload complete: %ld bytes",
+						"Upload complete: %lu bytes",
 						uplpos);
 					statline(mode, s);
 					restorecursor(mode, &win_out);
 					continue;
 				}
 				if (upllen == -1) {
+					if (errno == EINTR)
+						continue;
+					if (autobin) {
+						upload_error_message =
+							"Error reading upload file: upload aborted";
+						goto upload_data_abort;
+					}
 					close(uploadfile);
 					uploadfile = -1;
 					delwin(swin);
 					winclose(&wintab);
 					sprintf(s,
-						"Error reading upload file: upload aborted at %ld bytes",
+						"Error reading upload file: upload aborted at %lu bytes",
 						uplpos);
 					statline(mode, s);
 					restorecursor(mode, &win_out);
@@ -2763,37 +3101,92 @@ static int cmd_call(char *call[], int mode, int encoding)
 						      upllen);
 
 				upldp = 0;
+				if (autobin &&
+					(uplpos > uplsize ||
+					 (unsigned long)upllen > uplsize - uplpos)) {
+					upload_error_message =
+						"AutoBin upload aborted: file grew";
+					goto upload_data_abort;
+				}
 			}
-			bytes =
-			    write(fd, uplbuf + upldp,
-				  upllen - upldp);
+			if (upldp < 0 || upldp > upllen)
+				goto upload_data_abort;
+			upload_requested = (size_t)(upllen - upldp);
+			if (upload_requested == 0)
+				goto upload_data_abort;
+			if (uplpos > (unsigned long)LONG_MAX ||
+				 upload_requested >
+				 (size_t)((unsigned long)LONG_MAX - uplpos)) {
+				upload_error_message =
+					"Upload aborted: byte counter overflow";
+				goto upload_data_abort;
+			}
+			if (autobin) {
+				if (uplpos > uplsize) {
+					upload_error_message =
+						"AutoBin upload aborted: size exceeded";
+					goto upload_data_abort;
+				}
+				upload_remaining = uplsize - uplpos;
+				if (upload_requested > (size_t)upload_remaining) {
+					upload_error_message =
+						"AutoBin upload aborted: size exceeded";
+					goto upload_data_abort;
+				}
+			}
+			upload_start = (unsigned long)upldp;
+			upload_written = write(fd, uplbuf + upldp,
+				upload_requested);
 
-			if (bytes == 0) {
-				break;
+			if (upload_written == 0) {
+				upload_error_message = "Write returned zero during upload";
+				goto upload_data_abort;
 			}
-			if (bytes == -1) {
+			if (upload_written == -1) {
+				if (errno == EINTR)
+					continue;
 				if (errno != EWOULDBLOCK && errno != EAGAIN) {
-					sprintf(s, "Write error during upload. Connection lost");
-					statline(mode, s);
-					restorecursor(mode, &win_out);
 					perror("write");
-					break;
+					upload_error_message =
+						"Write error during upload. Connection lost";
+					goto upload_data_abort;
 				}
 				usleep(100000);
 				continue;
 			}
+			if (autobin)
+				tx_crc = calc_crc((unsigned char *)uplbuf + upload_start,
+					(int)upload_written, tx_crc);
 /*                      if (uplpos / 1024 != (uplpos + bytes) / 1024)
 			   { */ /*      printf("\r%ld bytes sent    ", uplpos + bytes); */
-				sprintf(s, "%ld", uplpos + bytes);
+				sprintf(s, "%lu", uplpos + (unsigned long)upload_written);
 				dupdstatw(swin, s, FALSE);
 /*			} */
 
-			uplpos += bytes;
-			upldp += bytes;
+			uplpos += (unsigned long)upload_written;
+			upldp += (int)upload_written;
 
 			if (upldp >= upllen)
 				upldp = -1;
 		}
+		continue;
+	 upload_data_abort:
+		abort_upload_resources(mode, &uploadfile, &binup, &autobin,
+			&swin, &wintab);
+		upldp = -1;
+		upllen = 0;
+		if (upload_error_message == NULL)
+			upload_error_message = "Upload aborted";
+		statline(mode, upload_error_message);
+		restorecursor(mode, &win_out);
+		upload_error_message = NULL;
+		continue;
+	}
+	if (uploadfile != -1) {
+		abort_upload_resources(mode, &uploadfile, &binup, &autobin,
+			&swin, &wintab);
+		statline(mode, "ERROR: upload interrupted; local file closed");
+		restorecursor(mode, &win_out);
 	}
 
 	close(fd);
@@ -2807,11 +3200,11 @@ static int cmd_call(char *call[], int mode, int encoding)
 		close(downloadfile);
 		downloadfile = -1;
 	}
-	if (gp.dwn_cnt != 0) {
-		close(gp.dwn_file);
-		gp.dwn_file = -1;
-		gp.dwn_cnt = 0;
-		gp.file_name[0] = '\0';
+	if (gp.dwn_active) {
+		snprintf(s, sizeof(s),
+			"ERROR: download interrupted; preserved %s", gp.file_name);
+		statline(mode, s);
+		reset_download_resources(mode, &swin, &wintab, &gp);
 	}
 	fcntl(STDIN_FILENO, F_SETFL, 0);
 
