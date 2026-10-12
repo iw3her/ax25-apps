@@ -12,7 +12,6 @@
  */
 
 #include <limits.h>
-#include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,7 +44,10 @@ struct ax25ipd_stats stats;	/* Usage statistics */
 
 int dual_port;			/* addition for dual port flag */
 
-static jmp_buf restart_env;
+/* Signal handlers only record events; the main loop performs the work. */
+static volatile sig_atomic_t got_hup;
+static volatile sig_atomic_t got_usr1;
+static volatile sig_atomic_t got_term;
 
 static int opt_version;
 static int opt_loglevel;
@@ -117,45 +119,61 @@ static void do_stats(void)
 	loglevel = save_loglevel;
 }
 
-static void hupper(int i)
+static void sig_handler(int sig)
 {
-	printf("\nSIGHUP!\n");
-	longjmp(restart_env, 1);
+	if (sig == SIGHUP)
+		got_hup = 1;
+	else if (sig == SIGUSR1)
+		got_usr1 = 1;
+	else
+		got_term = sig;
 }
 
-static void usr1_handler(int i)
+int check_signals(void)
 {
-	printf("\nSIGUSR1!\n");
-	do_stats();
-}
+	int restart = 0;
 
-static void int_handler(int i)
-{
-	printf("\nSIGINT!\n");
-	do_stats();
-	exit(1);
-}
+	if (got_hup) {
+		got_hup = 0;
+		restart = 1;
+		printf("\nSIGHUP: restarting ax25ipd to read its configuration again\n");
+		fflush(stdout);
+		syslog(LOG_DAEMON | LOG_WARNING,
+		       "SIGHUP: restarting ax25ipd to read its configuration again\n");
+	}
 
-static void term_handler(int i)
-{
-	printf("\nSIGTERM!\n");
-	do_stats();
-	exit(1);
+	if (got_usr1) {
+		got_usr1 = 0;
+		printf("\nSIGUSR1!\n");
+		do_stats();
+	}
+
+	if (got_term) {
+		printf("\n%s!\n", got_term == SIGINT ? "SIGINT" : "SIGTERM");
+		do_stats();
+		exit(1);
+	}
+
+	return restart;
 }
 
 int main(int argc, char **argv)
 {
-	if (setjmp(restart_env) == 0) {
-		signal(SIGHUP, hupper);
-	}
+	struct sigaction sa;
+	int daemonized = 0;
+	int stdio_closed = 0;
 
 	*opt_configfile = 0;
 	*opt_ttydevice = 0;
 
-	/* set up the handler for statistics reporting */
-	signal(SIGUSR1, usr1_handler);
-	signal(SIGINT, int_handler);
-	signal(SIGTERM, term_handler);
+	/* set up the handlers: statistics reporting and termination */
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = sig_handler;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGHUP, &sa, NULL);
+	sigaction(SIGUSR1, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
 
 	while (1) {
 		int c;
@@ -219,50 +237,54 @@ int main(int argc, char **argv)
 		exit(0);
 	}
 
-	/* Initialize all routines */
-	config_init();
-	kiss_init();
-	route_init();
-	process_init();
-	io_init();
+	for (;;) {
+		/* Initialize all routines, including after a deferred SIGHUP. */
+		config_init();
+		kiss_init();
+		route_init();
+		process_init();
+		io_init();
 
-	/* read config file */
-	config_read(opt_configfile);
+		/* read config file */
+		config_read(opt_configfile);
 
-	if (opt_ttydevice[0] != '\0') {
-		strncpy(ttydevice, opt_ttydevice, sizeof(ttydevice)-1);
-		ttydevice[sizeof(ttydevice)-1] = '\0';
-	}
-
-	/* print the current config and route info */
-	dump_config();
-	dump_routes();
-	dump_params();
-
-	/* Open the IO stuff */
-	io_open();
-
-	/* if we get this far without error, let's fork off ! :-) */
-	if (opt_nofork == 0) {
-		if (!daemon_start(TRUE)) {
-			syslog(LOG_DAEMON | LOG_CRIT, "ax25ipd: cannot become a daemon\n");
-			return 1;
+		if (opt_ttydevice[0] != '\0') {
+			strncpy(ttydevice, opt_ttydevice, sizeof(ttydevice)-1);
+			ttydevice[sizeof(ttydevice)-1] = '\0';
 		}
-	}
 
-	/* we need to close stdin, stdout, stderr: because otherwise
-	 * scripting like ttyname=$(ax25ipd | tail -1) does not work
-	 */
-	if (!isatty(1)) {
-		fflush(stdout);
-		fflush(stderr);
-		close(0);
-		close(1);
-		close(2);
-	}
+		/* print the current config and route info */
+		dump_config();
+		dump_routes();
+		dump_params();
 
-	/* and let the games begin */
-	io_start();
+		/* Open the IO stuff */
+		io_open();
+
+		/* if we get this far without error, let's fork off ! :-) */
+		if (opt_nofork == 0 && !daemonized) {
+			if (!daemon_start(TRUE)) {
+				syslog(LOG_DAEMON | LOG_CRIT, "ax25ipd: cannot become a daemon\n");
+				return 1;
+			}
+			daemonized = 1;
+		}
+
+		/* we need to close stdin, stdout, stderr: because otherwise
+		 * scripting like ttyname=$(ax25ipd | tail -1) does not work
+		 */
+		if (!stdio_closed && !isatty(1)) {
+			fflush(stdout);
+			fflush(stderr);
+			close(0);
+			close(1);
+			close(2);
+			stdio_closed = 1;
+		}
+
+		/* and let the games begin */
+		io_start();
+	}
 
 	return 0;
 }

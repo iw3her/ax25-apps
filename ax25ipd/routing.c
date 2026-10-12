@@ -52,11 +52,27 @@ struct bcast_table_entry {
 static struct bcast_table_entry *bcast_tbl;
 
 /* Initialize the routing module */
-void route_init(void)
+void route_cleanup(void)
 {
+	struct route_table_entry *route, *next_route;
+	struct bcast_table_entry *bcast, *next_bcast;
+
+	for (route = route_tbl; route != NULL; route = next_route) {
+		next_route = route->next;
+		free(route);
+	}
+	for (bcast = bcast_tbl; bcast != NULL; bcast = next_bcast) {
+		next_bcast = bcast->next;
+		free(bcast);
+	}
 	route_tbl = NULL;
 	default_route = NULL;
 	bcast_tbl = NULL;
+}
+
+void route_init(void)
+{
+	route_cleanup();
 }
 
 /* Add a new route entry */

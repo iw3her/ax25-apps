@@ -107,6 +107,7 @@ void send_params(void);
 
 /* routing.c */
 void route_init(void);
+void route_cleanup(void);
 void route_add(unsigned char *, unsigned char *, int, unsigned int);
 void bcast_add(unsigned char *);
 unsigned char *call_to_ip(unsigned char *);
@@ -137,6 +138,7 @@ void dump_ax25frame(char *, unsigned char *, int);
 void io_init(void);
 void io_open(void);
 void io_start(void);
+int check_signals(void);
 void send_ip(unsigned char *, int, unsigned char *);
 void send_tty(unsigned char *, int);
 

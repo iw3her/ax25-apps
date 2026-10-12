@@ -13,6 +13,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <limits.h>
 #include <memory.h>
 #include <netdb.h>
@@ -389,6 +390,8 @@ int a_to_call(char *text, unsigned char *tcall)
 {
 	int i;
 	int ssid;
+	long parsed_ssid;
+	char *end;
 	unsigned char c;
 
 	if (strlen(text) == 0)
@@ -403,9 +406,12 @@ int a_to_call(char *text, unsigned char *tcall)
 	for (i = 0; i < strlen(text); i++) {
 		c = text[i];
 		if (c == '-') {
-			ssid = atoi(&text[i + 1]);
-			if (ssid > 15)
+			errno = 0;
+			parsed_ssid = strtol(&text[i + 1], &end, 10);
+			if (end == &text[i + 1] || *end != '\0' ||
+				errno == ERANGE || parsed_ssid < 0 || parsed_ssid > 15)
 				return -1;
+			ssid = (int) parsed_ssid;
 			tcall[6] = (ssid << 1);
 			return 0;
 		}
