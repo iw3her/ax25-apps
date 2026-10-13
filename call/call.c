@@ -3045,7 +3045,7 @@ static int cmd_call(char *call[], int mode, int encoding)
 				delwin(swin);
 				winclose(&wintab);
 				statline(mode,
-					 "Upload complete: 0 bytes");
+					 "Upload locally complete: 0 bytes (delivery unconfirmed)");
 				restorecursor(mode, &win_out);
 				continue;
 			}
@@ -3081,7 +3081,7 @@ static int cmd_call(char *call[], int mode, int encoding)
 					delwin(swin);
 					winclose(&wintab);
 					sprintf(s,
-						"Upload complete: %lu bytes",
+						"Upload locally complete: %lu bytes (delivery unconfirmed)",
 						uplpos);
 					statline(mode, s);
 					restorecursor(mode, &win_out);
