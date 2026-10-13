@@ -2478,6 +2478,16 @@ static int cmd_call(char *call[], int mode, int encoding)
 					perror("read");
 				break;
 			}
+			if (uploadfile != -1 && autobin && bytes == 8 &&
+			    memcmp(buf, "#ABORT#\r", 8) == 0) {
+				abort_upload_resources(mode, &uploadfile, &binup,
+					&autobin, &swin, &wintab);
+				upldp = -1;
+				upllen = 0;
+				statline(mode, "ERROR: remote AutoBin abort; local file closed");
+				restorecursor(mode, &win_out);
+				continue;
+			}
 			if (gp.dwn_active) {
 				ab_down(mode, &swin, &wintab, buf, &bytes,
 					&gp);
