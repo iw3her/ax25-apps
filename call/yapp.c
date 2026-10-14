@@ -74,66 +74,241 @@ static int outbufptr = 0;
 static unsigned char outbuffer[512];
 static char yappc;		/* Nonzero if using YAPP C */
 
+#define YAPP_SEND_ERROR   (-1)
+#define YAPP_SEND_DONE    0
+#define YAPP_SEND_PENDING 1
+
+#define YAPP_HANDLER_ERROR 0
+#define YAPP_HANDLER_OK    1
+#define YAPP_HANDLER_WAIT  2
+
+static unsigned char yapp_tx_pending[257];
+static int yapp_tx_length;
+static int yapp_tx_offset;
+static int yapp_tx_next_state;
+static int yapp_tx_abort_after;
+
+static void yapp_tx_reset(void)
+{
+	yapp_tx_length = 0;
+	yapp_tx_offset = 0;
+	yapp_tx_next_state = -1;
+	yapp_tx_abort_after = FALSE;
+}
+
+static int yapp_tx_is_pending(void)
+{
+	return yapp_tx_offset < yapp_tx_length;
+}
+
+static int yapp_tx_flush(void)
+{
+	ssize_t n;
+
+	if (!yapp_tx_is_pending())
+		return YAPP_SEND_DONE;
+
+	n = write(fd, yapp_tx_pending + yapp_tx_offset,
+		(size_t)(yapp_tx_length - yapp_tx_offset));
+	if (n > 0) {
+		if (n != yapp_tx_length - yapp_tx_offset) {
+			errno = EPROTO;
+			return YAPP_SEND_ERROR;
+		}
+		yapp_tx_offset = yapp_tx_length;
+		if (yapp_tx_next_state >= 0)
+			state = yapp_tx_next_state;
+		yapp_tx_next_state = -1;
+		return YAPP_SEND_DONE;
+	}
+	if (n == 0) {
+		errno = EIO;
+		return YAPP_SEND_ERROR;
+	}
+	if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+		return YAPP_SEND_PENDING;
+	return YAPP_SEND_ERROR;
+}
+
+static int yapp_tx_send(const void *data, size_t length, int next_state,
+	int abort_after)
+{
+	ssize_t n;
+
+	if (length == 0 || length > sizeof(yapp_tx_pending) ||
+		yapp_tx_is_pending()) {
+		errno = EBUSY;
+		return YAPP_SEND_ERROR;
+	}
+
+	n = write(fd, data, length);
+	if (n == (ssize_t)length) {
+		if (next_state >= 0)
+			state = next_state;
+		return YAPP_SEND_DONE;
+	}
+	if (n > 0) {
+		errno = EPROTO;
+		return YAPP_SEND_ERROR;
+	}
+	if (n == 0) {
+		errno = EIO;
+		return YAPP_SEND_ERROR;
+	}
+	if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+		return YAPP_SEND_ERROR;
+
+	memcpy(yapp_tx_pending, data, length);
+	yapp_tx_length = (int)length;
+	yapp_tx_offset = 0;
+	yapp_tx_next_state = next_state;
+	yapp_tx_abort_after = abort_after;
+	return YAPP_SEND_PENDING;
+}
+
+static int yapp_tx_finish_pending(void)
+{
+	int result = yapp_tx_flush();
+
+	if (result == YAPP_SEND_DONE && yapp_tx_abort_after) {
+		yapp_tx_abort_after = FALSE;
+		return YAPP_SEND_ERROR;
+	}
+	return result;
+}
+
+/* Terminal control frames must not be abandoned when their first write gets
+ * EAGAIN.  Wait for writability with the existing YAPP timeout, while also
+ * monitoring RX so a congested terminal frame is not a write-only wait. */
+static int yapp_tx_drain_terminal(void)
+{
+	struct timespec deadline;
+	struct timespec now;
+	struct timeval timeout;
+	fd_set sock_read;
+	fd_set sock_write;
+	unsigned char discard[512];
+	int result;
+	int n;
+	ssize_t length;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
+		return -1;
+	deadline = now;
+	deadline.tv_sec += TIMEOUT;
+
+	while (yapp_tx_is_pending()) {
+		if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
+			return -1;
+		if (now.tv_sec > deadline.tv_sec ||
+			(now.tv_sec == deadline.tv_sec &&
+			 now.tv_nsec >= deadline.tv_nsec)) {
+			errno = ETIMEDOUT;
+			return -1;
+		}
+
+		timeout.tv_sec = deadline.tv_sec - now.tv_sec;
+		timeout.tv_usec = (deadline.tv_nsec - now.tv_nsec) / 1000;
+		if (timeout.tv_usec < 0) {
+			timeout.tv_sec--;
+			timeout.tv_usec += 1000000;
+		}
+
+		FD_ZERO(&sock_read);
+		FD_ZERO(&sock_write);
+		FD_SET(fd, &sock_read);
+		FD_SET(fd, &sock_write);
+		n = select(fd + 1, &sock_read, &sock_write, NULL, &timeout);
+		if (n == -1) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (n == 0) {
+			errno = ETIMEDOUT;
+			return -1;
+		}
+		if (FD_ISSET(fd, &sock_read)) {
+			length = read(fd, discard, sizeof(discard));
+			if (length == 0) {
+				errno = ECONNRESET;
+				return -1;
+			}
+			if (length == -1 && errno != EINTR &&
+				errno != EAGAIN && errno != EWOULDBLOCK)
+				return -1;
+		}
+		if (!FD_ISSET(fd, &sock_write))
+			continue;
+		result = yapp_tx_flush();
+		if (result == YAPP_SEND_ERROR)
+			return -1;
+	}
+	yapp_tx_abort_after = FALSE;
+	return 0;
+}
+
 static void Write_Status(char *s)
 {
 	fprintf(stdout, "State: %-60s\r", s);
 	fflush(stdout);
 }
 
-static void Send_RR(void)
+static int Send_RR(int next_state)
 {
 	char buffer[2];
 
 	buffer[0] = ACK;
 	buffer[1] = 0x01;
 
-	write(fd, buffer, 2);
+	return yapp_tx_send(buffer, 2, next_state, FALSE);
 }
 
-static void Send_RF(void)
+static int Send_RF(int next_state)
 {
 	char buffer[2];
 
 	buffer[0] = ACK;
 	buffer[1] = 0x02;
 
-	write(fd, buffer, 2);
+	return yapp_tx_send(buffer, 2, next_state, FALSE);
 }
 
-static void Send_RT(void)
+static int Send_RT(int next_state)
 {
 	char buffer[2];
 
 	buffer[0] = ACK;
 	buffer[1] = ACK;
 
-	write(fd, buffer, 2);
+	return yapp_tx_send(buffer, 2, next_state, FALSE);
 }
 
-static void Send_AF(void)
+static int Send_AF(int next_state)
 {
 	char buffer[2];
 
 	buffer[0] = ACK;
 	buffer[1] = 0x03;
 
-	write(fd, buffer, 2);
+	return yapp_tx_send(buffer, 2, next_state, FALSE);
 }
 
-static void Send_AT(void)
+static int Send_AT(int next_state)
 {
 	char buffer[2];
 
 	buffer[0] = ACK;
 	buffer[1] = 0x04;
 
-	write(fd, buffer, 2);
+	return yapp_tx_send(buffer, 2, next_state, FALSE);
 }
 
-static void Send_NR(char *reason)
+static int Send_NR(char *reason)
 {
 	char buffer[257];
 	int length;
+	int result;
 
 	length = strlen(reason);
 	if (length > 255)
@@ -143,12 +318,13 @@ static void Send_NR(char *reason)
 	buffer[1] = length;
 	memcpy(buffer + 2, reason, length);
 
-	write(fd, buffer, length + 2);
+	result = yapp_tx_send(buffer, length + 2, -1, TRUE);
+	return result;
 }
 
 /* Send a Resume Sequence */
 
-static void Send_RS(int length)
+static int Send_RS(int length, int next_state)
 {
 	char buffer[256];
 	int len;
@@ -163,23 +339,24 @@ static void Send_RS(int length)
 	buffer[len + 1] = 0;
 	buffer[1] = len;
 
-	write(fd, buffer, len + 2);
+	return yapp_tx_send(buffer, len + 2, next_state, FALSE);
 }
 
-static void Send_SI(void)
+static int Send_SI(void)
 {
 	char buffer[2];
 
 	buffer[0] = ENQ;
 	buffer[1] = 0x01;
 
-	write(fd, buffer, 2);
+	return yapp_tx_send(buffer, 2, -1, FALSE);
 }
 
-static void Send_CN(char *reason)
+static int Send_CN(char *reason)
 {
 	char buffer[257];
 	int length;
+	int result;
 
 	length = strlen(reason);
 	if (length > 255)
@@ -189,10 +366,24 @@ static void Send_CN(char *reason)
 	buffer[1] = length;
 	memcpy(buffer + 2, reason, length);
 
-	write(fd, buffer, length + 2);
+	result = yapp_tx_send(buffer, length + 2, -1, TRUE);
+	return result;
 }
 
-static void Send_HD(char *filename, long length)
+static int yapp_send_terminal(int (*sender)(char *), char *reason)
+{
+	int result;
+
+	result = sender(reason);
+	if (result == YAPP_SEND_PENDING) {
+		if (yapp_tx_drain_terminal() == -1)
+			return YAPP_SEND_ERROR;
+		return YAPP_SEND_DONE;
+	}
+	return result;
+}
+
+static int Send_HD(char *filename, long length)
 {
 	char buffer[257];
 	char size_buffer[12];
@@ -219,20 +410,20 @@ static void Send_HD(char *filename, long length)
 	memcpy(buffer + 2, filename, len_filename);
 	memcpy(buffer + len_filename + 2, size_buffer, len_size);
 
-	write(fd, buffer, len + 2);
+	return yapp_tx_send(buffer, len + 2, STATE_SH, FALSE);
 }
 
-static void Send_ET(void)
+static int Send_ET(void)
 {
 	char buffer[2];
 
 	buffer[0] = EOT;
 	buffer[1] = 0x01;
 
-	write(fd, buffer, 2);
+	return yapp_tx_send(buffer, 2, STATE_ST, FALSE);
 }
 
-static void Send_DT(int length)
+static int Send_DT(int length)
 {
 	char buffer[2];
 
@@ -242,17 +433,17 @@ static void Send_DT(int length)
 	buffer[0] = STX;
 	buffer[1] = length;
 
-	write(fd, buffer, 2);
+	return yapp_tx_send(buffer, 2, STATE_SD, FALSE);
 }
 
-static void Send_EF(void)
+static int Send_EF(void)
 {
 	char buffer[2];
 
 	buffer[0] = ETX;
 	buffer[1] = 0x01;
 
-	write(fd, buffer, 2);
+	return yapp_tx_send(buffer, 2, STATE_SE, FALSE);
 }
 
 static unsigned char checksum(unsigned char *buf, int len)
@@ -269,6 +460,7 @@ static unsigned char checksum(unsigned char *buf, int len)
 static int yapp_download_data(int *filefd, unsigned char *buffer)
 {
 	int length, file_time;
+	int send_result;
 	char Message[50];
 
 	if (buffer[0] == CAN || buffer[0] == NAK) {
@@ -279,15 +471,21 @@ static int yapp_download_data(int *filefd, unsigned char *buffer)
 	switch (state) {
 	case STATE_R:
 		if (buffer[0] == ENQ && buffer[1] == 0x01) {
-			Send_RR();
+			send_result = Send_RR(STATE_RH);
+			if (send_result == YAPP_SEND_ERROR)
+				return YAPP_HANDLER_ERROR;
+			if (send_result == YAPP_SEND_PENDING)
+				return YAPP_HANDLER_WAIT;
 			Write_Status("RcvHeader");
-			state = STATE_RH;
 			break;
 		}
 
-		Send_CN("Unknown code");
+		send_result = Send_CN("Unknown code");
 		Write_Status("SndABORT");
-		return FALSE;
+		if (send_result == YAPP_SEND_ERROR)
+			return YAPP_HANDLER_ERROR;
+		return send_result == YAPP_SEND_PENDING ?
+			YAPP_HANDLER_WAIT : YAPP_HANDLER_ERROR;
 
 	case STATE_RH:
 		if (buffer[0] == SOH) {
@@ -319,8 +517,9 @@ static int yapp_download_data(int *filefd, unsigned char *buffer)
 				if (*filefd == -1) {
 					printf("\n[Unable to open %s]\n",
 					       hfield[0]);
-					Send_NR("Invalid filename");
-					return FALSE;
+					send_result = Send_NR("Invalid filename");
+					return send_result == YAPP_SEND_PENDING ?
+						YAPP_HANDLER_WAIT : YAPP_HANDLER_ERROR;
 				}
 			}
 
@@ -332,14 +531,16 @@ static int yapp_download_data(int *filefd, unsigned char *buffer)
 				struct stat sb;
 
 				if (!fstat(*filefd, &sb) && sb.st_size)
-					Send_RS(sb.st_size);
+					send_result = Send_RS(sb.st_size, STATE_RD);
 				else
-					Send_RT();
+					send_result = Send_RT(STATE_RD);
 			} else {
-				Send_RF();
+				send_result = Send_RF(STATE_RD);
 			}
-
-			state = STATE_RD;
+			if (send_result == YAPP_SEND_ERROR)
+				return YAPP_HANDLER_ERROR;
+			if (send_result == YAPP_SEND_PENDING)
+				return YAPP_HANDLER_WAIT;
 			break;
 		}
 
@@ -348,14 +549,23 @@ static int yapp_download_data(int *filefd, unsigned char *buffer)
 		}
 
 		if (buffer[0] == EOT && buffer[1] == 0x01) {
-			Send_AT();
+			send_result = Send_AT(-1);
 			Write_Status("RcvEOT");
-			return FALSE;
+			if (send_result == YAPP_SEND_ERROR)
+				return YAPP_HANDLER_ERROR;
+			if (send_result == YAPP_SEND_PENDING) {
+				yapp_tx_abort_after = TRUE;
+				return YAPP_HANDLER_WAIT;
+			}
+			return YAPP_HANDLER_ERROR;
 		}
 
-		Send_CN("Unknown code");
+		send_result = Send_CN("Unknown code");
 		Write_Status("SndABORT");
-		return FALSE;
+		if (send_result == YAPP_SEND_ERROR)
+			return YAPP_HANDLER_ERROR;
+		return send_result == YAPP_SEND_PENDING ?
+			YAPP_HANDLER_WAIT : YAPP_HANDLER_ERROR;
 
 	case STATE_RD:
 		if (buffer[0] == STX) {
@@ -375,10 +585,13 @@ static int yapp_download_data(int *filefd, unsigned char *buffer)
 					checksum += buffer[i + 2];
 
 				if (checksum != buffer[length + 2]) {
-					Send_CN("Bad Checksum");
+					send_result = Send_CN("Bad Checksum");
 					Write_Status
 					    ("SndABORT: Bad Checksum");
-					return FALSE;
+					if (send_result == YAPP_SEND_ERROR)
+						return YAPP_HANDLER_ERROR;
+					return send_result == YAPP_SEND_PENDING ?
+						YAPP_HANDLER_WAIT : YAPP_HANDLER_ERROR;
 				}
 			}
 
@@ -387,30 +600,39 @@ static int yapp_download_data(int *filefd, unsigned char *buffer)
 		}
 
 		if (buffer[0] == ETX && buffer[1] == 0x01) {
-			Send_AF();
+			send_result = Send_AF(STATE_RH);
 			Write_Status("RcvEof");
-			state = STATE_RH;
 			close(*filefd);
 			*filefd = -1;
+			if (send_result == YAPP_SEND_ERROR)
+				return YAPP_HANDLER_ERROR;
+			if (send_result == YAPP_SEND_PENDING)
+				return YAPP_HANDLER_WAIT;
 			break;
 		}
 
-		Send_CN("Unknown code");
+		send_result = Send_CN("Unknown code");
 		Write_Status("SndABORT");
-		return FALSE;
+		if (send_result == YAPP_SEND_ERROR)
+			return YAPP_HANDLER_ERROR;
+		return send_result == YAPP_SEND_PENDING ?
+			YAPP_HANDLER_WAIT : YAPP_HANDLER_ERROR;
 	}
 
-	return TRUE;
+	return YAPP_HANDLER_OK;
 }
 
 static void yapp_download(int filefd)
 {
 	struct timeval timeval;
 	fd_set sock_read;
+	fd_set sock_write;
 	int n;
 	int buflen = 0;
 	int length;
 	int used;
+	int handler_result;
+	int tx_result;
 	unsigned char buffer[1024];
 
 	Write_Status("RcvWait");
@@ -418,35 +640,50 @@ static void yapp_download(int filefd)
 	state = STATE_R;
 	total = 0;
 	yappc = 0;
+	yapp_tx_reset();
 
 	while (TRUE) {
 		FD_ZERO(&sock_read);
-		FD_SET(STDIN_FILENO, &sock_read);
+		FD_ZERO(&sock_write);
+		if (!yapp_tx_is_pending())
+			FD_SET(STDIN_FILENO, &sock_read);
 		FD_SET(fd, &sock_read);
+		if (yapp_tx_is_pending())
+			FD_SET(fd, &sock_write);
 
 		timeval.tv_usec = 0;
 		timeval.tv_sec = TIMEOUT;
 
-		n = select(fd + 1, &sock_read, NULL, NULL, &timeval);
+		n = select(fd + 1, &sock_read, &sock_write, NULL, &timeval);
 
 		if (n == -1) {
 			if (!interrupted && errno == EAGAIN)
 				continue;
 			if (!interrupted)
 				perror("select");
-			Send_CN("Internal error");
+			yapp_send_terminal(Send_CN, "Internal error");
 			Write_Status("SndABORT");
 			return;
 		}
 
 		if (n == 0) {	/* Timeout */
-			Send_CN("Timeout");
+			yapp_send_terminal(Send_CN, "Timeout");
 			Write_Status("SndABORT");
 			return;
 		}
 
+		if (yapp_tx_is_pending() && FD_ISSET(fd, &sock_write)) {
+			tx_result = yapp_tx_finish_pending();
+			if (tx_result == YAPP_SEND_ERROR) {
+				perror("write");
+				return;
+			}
+			if (yapp_tx_is_pending())
+				continue;
+		}
+
 		if (FD_ISSET(STDIN_FILENO, &sock_read)) {
-			Send_CN("Cancelled by user");
+			yapp_send_terminal(Send_CN, "Cancelled by user");
 			Write_Status("SndABORT");
 			return;
 		}
@@ -465,13 +702,16 @@ static void yapp_download(int filefd)
 					case ETX:
 					case EOT:
 						if (buflen >= 2) {
-							if (!yapp_download_data(&filefd, buffer))
+							handler_result = yapp_download_data(&filefd, buffer);
+							if (handler_result == YAPP_HANDLER_ERROR)
 								return;
 							buflen -= 2;
 							memcpy(buffer,
 							       buffer + 2,
 							       buflen);
 							used = TRUE;
+							if (handler_result == YAPP_HANDLER_WAIT)
+								break;
 						}
 						break;
 					default:
@@ -481,7 +721,8 @@ static void yapp_download(int filefd)
 						if (buffer[0] == STX)
 							length += yappc;
 						if (buflen >= (length + 2)) {
-							if (!yapp_download_data(&filefd, buffer))
+							handler_result = yapp_download_data(&filefd, buffer);
+							if (handler_result == YAPP_HANDLER_ERROR)
 								return;
 							buflen -=
 							    length + 2;
@@ -490,6 +731,8 @@ static void yapp_download(int filefd)
 							       length + 2,
 							       buflen);
 							used = TRUE;
+							if (handler_result == YAPP_HANDLER_WAIT)
+								break;
 						}
 						break;
 					}
@@ -503,6 +746,7 @@ static void yapp_download(int filefd)
 static int yapp_upload_data(int filefd, char *filename, int filelength,
 			    unsigned char *buffer)
 {
+	int send_result;
 	char Message[80];
 
 	if (buffer[0] == CAN || buffer[0] == NAK) {
@@ -514,8 +758,11 @@ static int yapp_upload_data(int filefd, char *filename, int filelength,
 	case STATE_S:
 		if (buffer[0] == ACK && buffer[1] == 0x01) {
 			Write_Status("SendHeader");
-			Send_HD(filename, filelength);
-			state = STATE_SH;
+			send_result = Send_HD(filename, filelength);
+			if (send_result == YAPP_SEND_ERROR)
+				return YAPP_HANDLER_ERROR;
+			if (send_result == YAPP_SEND_PENDING)
+				return YAPP_HANDLER_WAIT;
 			break;
 		}
 
@@ -526,22 +773,30 @@ static int yapp_upload_data(int filefd, char *filename, int filelength,
 			outlen = read(filefd, outbuffer, readlen);
 			outbufptr = 0;
 
-			if (outlen)
-				Send_DT(outlen);
-
 			if (yappc) {
 				outbuffer[outlen] =
 				    checksum(outbuffer, outlen);
 				outlen++;
 			}
+			if (outlen) {
+				send_result = Send_DT(outlen);
+				if (send_result == YAPP_SEND_ERROR)
+					return YAPP_HANDLER_ERROR;
+				if (send_result == YAPP_SEND_PENDING)
+					return YAPP_HANDLER_WAIT;
+			} else
+				state = STATE_SD;
 
 			state = STATE_SD;
 			break;
 		}
 
-		Send_CN("Unknown code");
+		send_result = Send_CN("Unknown code");
 		Write_Status("SndABORT");
-		return FALSE;
+		if (send_result == YAPP_SEND_ERROR)
+			return YAPP_HANDLER_ERROR;
+		return send_result == YAPP_SEND_PENDING ?
+			YAPP_HANDLER_WAIT : YAPP_HANDLER_ERROR;
 
 	case STATE_SH:
 		/* Could get three replies here:
@@ -572,50 +827,70 @@ static int yapp_upload_data(int filefd, char *filename, int filelength,
 			Write_Status(Message);
 			outlen = read(filefd, outbuffer, readlen);
 			outbufptr = 0;
-			if (outlen)
-				Send_DT(outlen);
-			state = STATE_SD;
 
 			if (yappc) {
 				outbuffer[outlen] =
 				    checksum(outbuffer, outlen);
 				outlen++;
 			}
+			if (outlen) {
+				send_result = Send_DT(outlen);
+				if (send_result == YAPP_SEND_ERROR)
+					return YAPP_HANDLER_ERROR;
+				if (send_result == YAPP_SEND_PENDING)
+					return YAPP_HANDLER_WAIT;
+			} else
+				state = STATE_SD;
 			break;
 		}
 
-		Send_CN("Unknown code");
+		send_result = Send_CN("Unknown code");
 		Write_Status("SndABORT");
-		return FALSE;
+		if (send_result == YAPP_SEND_ERROR)
+			return YAPP_HANDLER_ERROR;
+		return send_result == YAPP_SEND_PENDING ?
+			YAPP_HANDLER_WAIT : YAPP_HANDLER_ERROR;
 
 	case STATE_SD:
-		Send_CN("Unknown code");
+		send_result = Send_CN("Unknown code");
 		Write_Status("SndABORT");
-		return FALSE;
+		if (send_result == YAPP_SEND_ERROR)
+			return YAPP_HANDLER_ERROR;
+		return send_result == YAPP_SEND_PENDING ?
+			YAPP_HANDLER_WAIT : YAPP_HANDLER_ERROR;
 
 	case STATE_SE:
 		if (buffer[0] == ACK && buffer[1] == 0x03) {
 			Write_Status("SendEOT");
-			Send_ET();
-			state = STATE_ST;
+			send_result = Send_ET();
+			if (send_result == YAPP_SEND_ERROR)
+				return YAPP_HANDLER_ERROR;
+			if (send_result == YAPP_SEND_PENDING)
+				return YAPP_HANDLER_WAIT;
 			break;
 		}
 
-		Send_CN("Unknown code");
+		send_result = Send_CN("Unknown code");
 		Write_Status("SndABORT");
-		return FALSE;
+		if (send_result == YAPP_SEND_ERROR)
+			return YAPP_HANDLER_ERROR;
+		return send_result == YAPP_SEND_PENDING ?
+			YAPP_HANDLER_WAIT : YAPP_HANDLER_ERROR;
 
 	case STATE_ST:
 		if (buffer[0] == ACK && buffer[1] == 0x04) {
 			return FALSE;
 		}
 
-		Send_CN("Unknown code");
+		send_result = Send_CN("Unknown code");
 		Write_Status("SndABORT");
-		return FALSE;
+		if (send_result == YAPP_SEND_ERROR)
+			return YAPP_HANDLER_ERROR;
+		return send_result == YAPP_SEND_PENDING ?
+			YAPP_HANDLER_WAIT : YAPP_HANDLER_ERROR;
 	}
 
-	return TRUE;
+	return YAPP_HANDLER_OK;
 }
 
 static void yapp_upload(int filefd, char *filename, long filelength)
@@ -628,6 +903,7 @@ static void yapp_upload(int filefd, char *filename, long filelength)
 	int buflen = 0;
 	int length;
 	int used;
+	int handler_result;
 	char Message[80];
 
 	Write_Status("SendInit");
@@ -636,16 +912,21 @@ static void yapp_upload(int filefd, char *filename, long filelength)
 	state = STATE_S;
 	total = 0;
 	yappc = 0;
+	yapp_tx_reset();
 
-	Send_SI();
+	if (Send_SI() == YAPP_SEND_ERROR) {
+		perror("write");
+		return;
+	}
 
 	while (TRUE) {
 		FD_ZERO(&sock_read);
 		FD_ZERO(&sock_write);
-		FD_SET(STDIN_FILENO, &sock_read);
+		if (!yapp_tx_is_pending())
+			FD_SET(STDIN_FILENO, &sock_read);
 		FD_SET(fd, &sock_read);
 
-		if (state == STATE_SD) {
+		if (state == STATE_SD || yapp_tx_is_pending()) {
 			FD_SET(fd, &sock_write);
 
 			n = select(fd + 1, &sock_read, &sock_write, NULL,
@@ -664,19 +945,29 @@ static void yapp_upload(int filefd, char *filename, long filelength)
 			if (!interrupted)
 				perror("select");
 			Write_Status("SndABORT");
-			Send_CN("Internal error");
+			yapp_send_terminal(Send_CN, "Internal error");
 			return;
 		}
 
 		if (n == 0) {	/* Timeout, not STATE_SD */
 			Write_Status("SndABORT");
-			Send_CN("Timeout");
+			yapp_send_terminal(Send_CN, "Timeout");
 			return;
+		}
+
+		if (yapp_tx_is_pending() && FD_ISSET(fd, &sock_write)) {
+			n = yapp_tx_finish_pending();
+			if (n == YAPP_SEND_ERROR) {
+				perror("write");
+				return;
+			}
+			if (yapp_tx_is_pending())
+				continue;
 		}
 
 		if (FD_ISSET(STDIN_FILENO, &sock_read)) {
 			Write_Status("SndABORT");
-			Send_CN("Cancelled by user");
+			yapp_send_terminal(Send_CN, "Cancelled by user");
 			return;
 		}
 
@@ -684,9 +975,22 @@ static void yapp_upload(int filefd, char *filename, long filelength)
 			if (outlen > 0) {
 				n = write(fd, outbuffer + outbufptr, outlen);
 				if (n > 0) {
+					if (n != outlen) {
+						errno = EPROTO;
+						perror("write");
+						return;
+					}
 					outbufptr += n;
 					outlen -= n;
 					total += n;
+				} else if (n == 0) {
+					errno = EIO;
+					perror("write");
+					return;
+				} else if (errno != EINTR && errno != EAGAIN &&
+					errno != EWOULDBLOCK) {
+					perror("write");
+					return;
 				}
 			}
 
@@ -701,7 +1005,10 @@ static void yapp_upload(int filefd, char *filename, long filelength)
 					Write_Status(Message);
 
 					outbufptr = 0;
-					Send_DT(outlen);
+					if (Send_DT(outlen) == YAPP_SEND_ERROR) {
+						perror("write");
+						return;
+					}
 
 					if (yappc) {
 						outbuffer[outlen] =
@@ -711,8 +1018,10 @@ static void yapp_upload(int filefd, char *filename, long filelength)
 					}
 				} else {
 					Write_Status("SendEof");
-					state = STATE_SE;
-					Send_EF();
+					if (Send_EF() == YAPP_SEND_ERROR) {
+						perror("write");
+						return;
+					}
 				}
 			}
 		}
@@ -731,13 +1040,17 @@ static void yapp_upload(int filefd, char *filename, long filelength)
 					case ETX:
 					case EOT:
 						if (buflen >= 2) {
-							if (!yapp_upload_data(filefd, filename, filelength, buffer))
+						handler_result = yapp_upload_data(filefd, filename,
+							filelength, buffer);
+						if (handler_result == YAPP_HANDLER_ERROR)
 								return;
 							buflen -= 2;
 							memcpy(buffer,
 							       buffer + 2,
 							       buflen);
 							used = TRUE;
+						if (handler_result == YAPP_HANDLER_WAIT)
+							break;
 						}
 						break;
 					default:
@@ -745,7 +1058,9 @@ static void yapp_upload(int filefd, char *filename, long filelength)
 						if (length == 0)
 							length = 256;
 						if (buflen >= (length + 2)) {
-							if (!yapp_upload_data(filefd, filename, filelength, buffer))
+							handler_result = yapp_upload_data(filefd, filename,
+							filelength, buffer);
+						if (handler_result == YAPP_HANDLER_ERROR)
 								return;
 							buflen -=
 							    length + 2;
@@ -754,6 +1069,8 @@ static void yapp_upload(int filefd, char *filename, long filelength)
 							       length + 2,
 							       buflen);
 							used = TRUE;
+						if (handler_result == YAPP_HANDLER_WAIT)
+							break;
 						}
 						break;
 					}
@@ -785,13 +1102,17 @@ void cmd_yapp(char *buf, int bytes)
 		if (*t == '\0') {
 			printf
 			    ("\n[YAPP Upload requires a filename - eg ~yu hello.txt]\n");
-			Send_NR("No filename");
+			if (yapp_send_terminal(Send_NR, "No filename") ==
+				YAPP_SEND_ERROR)
+				perror("write");
 			return;
 		}
 		filefd = open(t, O_RDONLY);
 		if (filefd == -1) {
 			printf("\n[Unable to open upload file]\n");
-			Send_NR("Invalid filename");
+			if (yapp_send_terminal(Send_NR, "Invalid filename") ==
+				YAPP_SEND_ERROR)
+				perror("write");
 			return;
 		}
 		if (lseek(filefd, 0L, SEEK_END) != -1)
@@ -822,7 +1143,9 @@ void cmd_yapp(char *buf, int bytes)
 		else {filefd = open(t, O_RDWR | O_APPEND | O_CREAT, 0666);
 			if (filefd == -1) {
 				printf("\n[Unable to open %s]\n", buf + 2);
-				Send_NR("Invalid filename");
+				if (yapp_send_terminal(Send_NR, "Invalid filename") ==
+					YAPP_SEND_ERROR)
+					perror("write");
 				return;
 			}
 		}

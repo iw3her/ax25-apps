@@ -46,8 +46,6 @@
 #include <locale.h>
 #include <iconv.h>
 #include <sys/ioctl.h>
-#include <poll.h>
-
 #include <netax25/ax25.h>
 #include <netrom/netrom.h>
 #include <netrose/rose.h>
@@ -565,78 +563,6 @@ static void reset_download_resources(int mode, WINDOW **swin, wint *wintab,
 	}
 }
 
-static int write_full_retry(int fd, const void *buffer, size_t length)
-{
-	const char *data = buffer;
-	const time_t timeout_seconds = 60;
-	struct timespec deadline;
-	struct timespec now;
-	struct pollfd pfd;
-	ssize_t written;
-	int poll_timeout;
-	int poll_result;
-
-	if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
-		return -1;
-	deadline = now;
-	deadline.tv_sec += timeout_seconds;
-	pfd.fd = fd;
-	pfd.events = POLLOUT;
-	pfd.revents = 0;
-
-	while (TRUE) {
-		if (clock_gettime(CLOCK_MONOTONIC, &now) == -1)
-			return -1;
-		if (now.tv_sec > deadline.tv_sec ||
-			(now.tv_sec == deadline.tv_sec &&
-			 now.tv_nsec >= deadline.tv_nsec)) {
-			errno = ETIMEDOUT;
-			return -1;
-		}
-
-		written = write(fd, data, length);
-		if (written == (ssize_t)length)
-			return 0;
-		if (written > 0) {
-			errno = EIO;
-			return -1;
-		}
-		if (written == 0) {
-			errno = EIO;
-			return -1;
-		}
-		if (errno == EINTR)
-			continue;
-		if (errno != EAGAIN && errno != EWOULDBLOCK)
-			return -1;
-
-		poll_timeout = (int)((deadline.tv_sec - now.tv_sec) * 1000 +
-			(deadline.tv_nsec - now.tv_nsec + 999999) / 1000000);
-		if (poll_timeout <= 0) {
-			errno = ETIMEDOUT;
-			return -1;
-		}
-		poll_result = poll(&pfd, 1, poll_timeout);
-		if (poll_result == -1) {
-			if (errno == EINTR)
-				continue;
-			return -1;
-		}
-		if (poll_result == 0) {
-			errno = ETIMEDOUT;
-			return -1;
-		}
-		if (pfd.revents & POLLNVAL) {
-			errno = EBADF;
-			return -1;
-		}
-		if (pfd.revents & (POLLERR | POLLHUP)) {
-			errno = EPIPE;
-			return -1;
-		}
-	}
-}
-
 static int write_file_full(int fd, const void *buffer, size_t length)
 {
 	const char *data = buffer;
@@ -656,6 +582,146 @@ static int write_file_full(int fd, const void *buffer, size_t length)
 		return -1;
 	}
 	return 0;
+}
+
+struct pending_tx {
+	unsigned char data[MAX_BUFLEN];
+	size_t length;
+	size_t record_start;
+	size_t record_length;
+	size_t offset;
+	int active;
+};
+
+static void pending_tx_clear(struct pending_tx *pending)
+{
+	pending->length = 0;
+	pending->record_start = 0;
+	pending->record_length = 0;
+	pending->offset = 0;
+	pending->active = FALSE;
+}
+
+static int pending_tx_start(struct pending_tx *pending,
+	const unsigned char *data, size_t length, size_t record_size)
+{
+	if (pending->active || length == 0 || length > sizeof(pending->data) ||
+		record_size == 0 || record_size > sizeof(pending->data)) {
+		errno = EINVAL;
+		return -1;
+	}
+	memcpy(pending->data, data, length);
+	pending->length = length;
+	pending->record_start = 0;
+	pending->record_length = (length < record_size) ? length : record_size;
+	pending->offset = 0;
+	pending->active = TRUE;
+	return 0;
+}
+
+/* Flush at most one socket record.  A positive short write is not valid for
+ * the SOCK_SEQPACKET sockets used by call and is therefore an error. */
+static int pending_tx_flush(int fd, struct pending_tx *pending,
+	size_t record_size)
+{
+	ssize_t written;
+	size_t remaining;
+
+	if (!pending->active)
+		return 1;
+	remaining = pending->record_length - pending->offset;
+	written = write(fd, pending->data + pending->record_start + pending->offset,
+		remaining);
+	if (written > 0) {
+		if ((size_t)written != remaining) {
+			errno = EPROTO;
+			return -1;
+		}
+		pending->record_start += pending->record_length;
+		pending->offset = 0;
+		if (pending->record_start == pending->length) {
+			pending_tx_clear(pending);
+			return 1;
+		}
+		remaining = pending->length - pending->record_start;
+		pending->record_length = (remaining < record_size) ?
+			remaining : record_size;
+		return 0;
+	}
+	if (written == 0) {
+		errno = EIO;
+		return -1;
+	}
+	if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+		return 0;
+	return -1;
+}
+
+struct autobin_control_tx {
+	unsigned char data[MAX_BUFLEN];
+	size_t length;
+	int active;
+};
+
+static void autobin_control_clear(struct autobin_control_tx *control)
+{
+	control->length = 0;
+	control->active = FALSE;
+}
+
+/* AutoBin control messages are complete SOCK_SEQPACKET records.  A
+ * temporary inability to write retains the whole record; a positive short
+ * write is an explicit protocol error and is never retried as a new record. */
+static int autobin_control_start(int fd,
+	struct autobin_control_tx *control, const void *data, size_t length)
+{
+	ssize_t written;
+
+	if (control->active || length == 0 || length > sizeof(control->data)) {
+		errno = EINVAL;
+		return -1;
+	}
+	written = write(fd, data, length);
+	if (written == (ssize_t)length)
+		return 0;
+	if (written > 0) {
+		errno = EPROTO;
+		return -1;
+	}
+	if (written == 0) {
+		errno = EIO;
+		return -1;
+	}
+	if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+		return -1;
+	memcpy(control->data, data, length);
+	control->length = length;
+	control->active = TRUE;
+	return 1;
+}
+
+static int autobin_control_flush(int fd, struct autobin_control_tx *control)
+{
+	ssize_t written;
+
+	if (!control->active)
+		return 1;
+	written = write(fd, control->data, control->length);
+	if (written == (ssize_t)control->length) {
+		autobin_control_clear(control);
+		return 1;
+	}
+	if (written > 0) {
+		errno = EPROTO;
+		return -1;
+	}
+	if (written == 0) {
+		errno = EIO;
+		return -1;
+	}
+	if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+		return 0;
+	return -1;
 }
 
 static void convert_upper_lower(char *buf, int len)
@@ -1100,7 +1166,8 @@ static void dupdstatw(WINDOW * win, char *s, int add)
 
 static int start_ab_download(int mode, WINDOW ** swin, wint * wintab,
 		      char parms[], int parmsbytes, char buf[], int *bytes,
-		      t_gp * gp, char *address[])
+		      t_gp * gp, char *address[],
+		      struct autobin_control_tx *control)
 {
 	unsigned int date = 0;
 	struct tm ft;
@@ -1120,6 +1187,7 @@ static int start_ab_download(int mode, WINDOW ** swin, wint * wintab,
 	unsigned long offset;
 	size_t i;
 	int ret;
+	int control_result;
 	int name_result;
 	int time_set = 0;
 
@@ -1236,7 +1304,8 @@ static int start_ab_download(int mode, WINDOW ** swin, wint * wintab,
 			strcpy(gp->file_name, path);
 		snprintf(s, sizeof(s), "Unable to open %s", gp->file_name);
 		statline(mode, s);
-		if (write_full_retry(fd, "#ABORT#\r", 8) == -1) {
+		control_result = autobin_control_start(fd, control, "#ABORT#\r", 8);
+		if (control_result == -1) {
 			perror("write");
 		}
 		gp->dwn_cnt = 0;
@@ -1264,7 +1333,8 @@ static int start_ab_download(int mode, WINDOW ** swin, wint * wintab,
 	dupdstatw(*swin, "Bytes to receive: ", TRUE);
 	gp->calc_crc = 0;
 	if (*bytes == 1) {
-		if (write_full_retry(fd, "#OK#\r", 5) == -1) {
+		control_result = autobin_control_start(fd, control, "#OK#\r", 5);
+		if (control_result == -1) {
 			perror("write");
 			snprintf(s, sizeof(s), "ERROR: unable to acknowledge %s",
 				gp->file_name);
@@ -2357,6 +2427,8 @@ static int cmd_call(char *call[], int mode, int encoding)
 	char s[80];
 	int flags = 0;
 	int EOF_on_STDIN = FALSE;
+	struct pending_tx pending = {0};
+	struct autobin_control_tx autobin_control = {0};
 	sigset_t oursigs, oldsigs;
 
 	init_crc();
@@ -2416,12 +2488,12 @@ static int cmd_call(char *call[], int mode, int encoding)
 			tv.tv_nsec = 10000;		/* 10ms		*/
 		}
 		FD_ZERO(&sock_read);
-		if (EOF_on_STDIN == FALSE)
+		if (EOF_on_STDIN == FALSE && !pending.active)
 			FD_SET(STDIN_FILENO, &sock_read);
 		FD_SET(fd, &sock_read);
 		FD_ZERO(&sock_write);
 
-		if (uploadfile != -1)
+		if (uploadfile != -1 || pending.active || autobin_control.active)
 			FD_SET(fd, &sock_write);
 
 		if (uploadfile == -1 && downloadfile == -1 &&
@@ -2480,6 +2552,8 @@ static int cmd_call(char *call[], int mode, int encoding)
 			}
 			if (uploadfile != -1 && autobin && bytes == 8 &&
 			    memcmp(buf, "#ABORT#\r", 8) == 0) {
+				pending_tx_clear(&pending);
+				autobin_control_clear(&autobin_control);
 				abort_upload_resources(mode, &uploadfile, &binup,
 					&autobin, &swin, &wintab);
 				upldp = -1;
@@ -2487,6 +2561,26 @@ static int cmd_call(char *call[], int mode, int encoding)
 				statline(mode, "ERROR: remote AutoBin abort; local file closed");
 				restorecursor(mode, &win_out);
 				continue;
+			}
+			if (autobin_control.active) {
+				if (gp.dwn_active && bytes == 8 &&
+				    memcmp(buf, "#ABORT#\r", 8) == 0) {
+					autobin_control_clear(&autobin_control);
+					reset_download_resources(mode, &swin, &wintab, &gp);
+					bytes = 0;
+					statline(mode,
+						"ERROR: remote AutoBin abort; download closed");
+					continue;
+				}
+				if (gp.dwn_active) {
+					statline(mode,
+						"ERROR: AutoBin data received before control was sent");
+					reset_download_resources(mode, &swin, &wintab, &gp);
+				} else {
+					statline(mode,
+						"ERROR: data received while AutoBin control was pending");
+				}
+				break;
 			}
 			if (gp.dwn_active) {
 				ab_down(mode, &swin, &wintab, buf, &bytes,
@@ -2561,7 +2655,8 @@ static int cmd_call(char *call[], int mode, int encoding)
 								  restbuf,
 										  &restbytes,
 								  &gp,
-								  call);
+									  call,
+									  &autobin_control);
 					}
 					break;
 				case 2:
@@ -2608,6 +2703,23 @@ static int cmd_call(char *call[], int mode, int encoding)
 				memcpy(buf, restbuf, restbytes);
 				bytes = restbytes;
 			} while (restbytes != 0);
+		}
+			if (autobin_control.active && FD_ISSET(fd, &sock_write)) {
+				if (autobin_control_flush(fd, &autobin_control) == -1) {
+					perror("write");
+					break;
+				}
+				if (autobin_control.active)
+					continue;
+			}
+			if (pending.active && FD_ISSET(fd, &sock_write)) {
+			if (pending_tx_flush(fd, &pending, (size_t)paclen) == -1) {
+				perror("write");
+				pending_tx_clear(&pending);
+				break;
+			}
+			if (pending.active)
+				continue;
 		}
 		if (FD_ISSET(STDIN_FILENO, &sock_read)) {
 			if ((mode & RAWMODE) == RAWMODE) {
@@ -2862,8 +2974,8 @@ static int cmd_call(char *call[], int mode, int encoding)
 									uplsize, crc, bin_date, t) !=
 								bin_header_length)
 								goto bin_header_abort;
-			if (write_full_retry(fd, bin_header,
-					bin_header_size - 1) == -1) {
+			if (autobin_control_start(fd, &autobin_control,
+					bin_header, bin_header_size - 1) == -1) {
 								bin_error_message =
 									"AutoBin header write failed";
 								perror("write");
@@ -3000,9 +3112,6 @@ static int cmd_call(char *call[], int mode, int encoding)
 				break;
 
 			if (bytes > 0) {
-				unsigned long offset = 0L;
-				int err = 0;
-
 				sevenplus = FALSE;
 				if (uploadfile != -1) {
 					statline(mode,
@@ -3012,25 +3121,11 @@ static int cmd_call(char *call[], int mode, int encoding)
 				}
 
 				convert_lf_cr(buf, bytes);
-
-				while (offset != bytes) {
-					int len = (bytes-offset > paclen) ? paclen : bytes-offset;
-					int ret = write(fd, buf+offset, len);
-					if (ret == 0)
-						break;
-					if (ret == -1) {
-						if (errno == EWOULDBLOCK || errno == EAGAIN) {
-							usleep(100000);
-							continue;
-						}
-						perror("write");
-						err = 1;
-						break;
-					}
-					offset += ret;
-				}
-				if (err)
+				if (pending_tx_start(&pending, (unsigned char *)buf,
+					(size_t)bytes, (size_t)paclen) == -1) {
+					perror("write");
 					break;
+				}
 			}
 
 			if (EOF_on_STDIN == TRUE && wait_for_remote_disconnect == FALSE)
@@ -3144,6 +3239,8 @@ static int cmd_call(char *call[], int mode, int encoding)
 					goto upload_data_abort;
 				}
 			}
+			if (!FD_ISSET(fd, &sock_write))
+				continue;
 			upload_start = (unsigned long)upldp;
 			upload_written = write(fd, uplbuf + upldp,
 				upload_requested);
@@ -3161,8 +3258,12 @@ static int cmd_call(char *call[], int mode, int encoding)
 						"Write error during upload. Connection lost";
 					goto upload_data_abort;
 				}
-				usleep(100000);
 				continue;
+			}
+			if ((size_t)upload_written != upload_requested) {
+				upload_error_message =
+					"Partial record write during upload";
+				goto upload_data_abort;
 			}
 			if (autobin)
 				tx_crc = calc_crc((unsigned char *)uplbuf + upload_start,
