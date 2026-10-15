@@ -1,0 +1,27 @@
+From: Dave Hibberd <hibby@debian.org>
+Date: Tue, 16 Sep 2025 22:35:26 +0100
+Subject: Build as time_t instead of long
+
+Forwarded: no
+Last-Update: 2025-01-08
+
+Last-Update: 2025-01-08
+---
+ listen/opentracdump.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/listen/opentracdump.c b/listen/opentracdump.c
+index 25dbcf2..e07fe70 100644
+--- a/listen/opentracdump.c
++++ b/listen/opentracdump.c
+@@ -148,7 +148,9 @@ static int decode_position(unsigned char *element, int element_len)
+ static int decode_timestamp(unsigned char *element, int element_len)
+ {
+ 	/* 0x11 Timestamp - Unix format time (unsigned)  */
+-	long rawtime = 0;
++	// This is not a great solution, as opentrac standard only supports 32b
++	// time
++	time_t rawtime = 0;
+ 
+ 	rawtime = get32(element);
+ 	lprintf(T_OPENTRAC, "Time: %s", ctime(&rawtime));

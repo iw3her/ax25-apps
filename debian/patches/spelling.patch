@@ -1,0 +1,25 @@
+From: Dave Hibberd <hibby@debian.org>
+Date: Tue, 16 Sep 2025 22:35:26 +0100
+Subject: Fix spelling for lintian cleanliness
+
+Forwarded: no
+Last-Update: 2025-01-08
+
+Last-Update: 2025-01-08
+---
+ ax25ipd/io.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ax25ipd/io.c b/ax25ipd/io.c
+index 96bc9ca..3cfe0c4 100644
+--- a/ax25ipd/io.c
++++ b/ax25ipd/io.c
+@@ -91,7 +91,7 @@ static int io_error( int oops, unsigned char *buf, int bufsize, int dir,
+ 	if (oops == 0) {
+ 		if (dir == READ_MSG && oops != TTY_MODE /* && != TCP_MODE, if we'd implement this */ )
+ 			return 0;
+-		fprintf(stderr, "Close event on mode 0x%2.2x (during %s). LINE %d. Terminating normaly.\n", mode, (dir == READ_MSG ? "READ" : "WRITE"), where);
++		fprintf(stderr, "Close event on mode 0x%2.2x (during %s). LINE %d. Terminating normally.\n", mode, (dir == READ_MSG ? "READ" : "WRITE"), where);
+ 		exit(1);
+ 	}
+ 
