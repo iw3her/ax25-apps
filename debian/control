@@ -1,0 +1,32 @@
+Source: ax25-apps
+Maintainer: Debian Hamradio Maintainers <debian-hams@lists.debian.org>
+Uploaders: Francois Marier <francois@debian.org>,
+ 	   Dave Hibberd <hibby@debian.org>
+Section: hamradio
+Priority: optional
+Build-Depends: debhelper-compat (= 13)
+Build-Depends-Arch: libncurses-dev,
+               libax25-dev,
+               libtool
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+Vcs-Browser: https://salsa.debian.org/debian-hamradio-team/ax25-apps
+Vcs-Git: https://salsa.debian.org/debian-hamradio-team/ax25-apps.git
+Homepage: https://linux-ax25.in-berlin.de/wiki/Ax25-apps
+
+Package: ax25-apps
+Architecture: linux-any
+Depends: ${shlibs:Depends},
+         ${misc:Depends}
+Suggests: ax25-tools
+Conflicts: ax25-utils
+Description: AX.25 ham radio applications
+ This package provides specific user applications for hamradio
+ that use AX.25 Net/ROM or ROSE network protocols:
+  * axcall: a general purpose AX.25, NET/ROM and ROSE connection
+    program.
+  * axlisten: a network monitor of all AX.25 traffic heard by the system.
+  * ax25ipd: an RFC1226 compliant daemon which provides
+    encapsulation of AX.25 traffic over IP.
+  * ax25mond: retransmits data received from sockets into an AX.25
+    monitor socket.

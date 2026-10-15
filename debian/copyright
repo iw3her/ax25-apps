@@ -1,0 +1,110 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: ax25-apps
+Upstream-Contact: Thomas Osterried <thomas@osterried.de>
+Source: http://git.linux-ax25.org/cgit/ax25-apps.git
+
+Files: *
+Copyright: 1999-2024 Ralf Baechle <ralf@linux-mips.org>
+ 1999-2024 Thomas Osterried <thomas@osterried.de>
+ 1996-2001 Jonathan Naylor G4KLX <g4klx@g4klx.demon.co.uk>
+License: GPL-2+
+
+Files: debian/*
+Copyright:
+ Craig Small <csmall@debian.org>,
+ Christoph Berg <myon@debian.org>,
+ Daniele Forsi <iu5hkx@gmail.com>,
+ Dave Hibberd <hibby@debian.org>,
+ Patrick Ouellette <pouelle@debian.org>,
+ Francois Marier <francois@debian.org>,
+ Iain Learmonth <irl@debian.org>,
+ Colin Tuckley <colint@debian.org>
+License: GPL-2+
+
+Files: ax25ipd/*
+Copyright: 1991, Michael Westerhof <Mike.Westerhof@Central.Sun.com>
+ 1995-2000, Michael Durrant VE3PNX <mdurrant@arcturusnetworks.com>
+ 1995-2000, D. Jeff Dionne VE3DJF <Jeff@lnx_rpi.ee.ryerson.ca>
+ 1995-2000, Rob Mayfield VK5XXX/VK5ZEU <mayfieldrob@mail.dec.com>
+ 1997-2001, Terry Dawson VK2KTJ <terry@animats.net>
+License: Westerhof
+
+Files: ax25mond/*
+Copyright: 1998-1999, Johann Hanne DH3MB <jonny@baycom.org>
+License: GPL-2+
+
+Files: ax25rtd/*
+Copyright: 1996, Joerg Reuter <jreuter@poboxes.com>
+ 1996-2000, Klaus Kudielka OE1KIB <klaus.kudielka@ieee.org>
+License: GPL-2+
+
+Files: call/*
+Copyright: 1995, Alexander Tietzel DG6XA <TIETZE_A@etech.fh-hamburg.de>
+ 1996, Alan Cox GW4PTS <alan@cymru.net>
+ 1995-1996, Jonathan Naylor G4KLX <g4klx@g4klx.demon.co.uk>
+ 1995-2000, Joerg Reuter DL1BKE <jreuter@poboxes.com>
+ 1995-2000, Steve Henson G6IXS <shenson@nyx.cs.du.edu>
+ 1996-1997, Terry Dawson VK2KTJ <terry@animats.net>
+ 1993 Mark Wahl DL4YBG <wahlm@berlin.snafu.de>
+ 1992-1993 Werner Almesberger <werner@almesberger.net>
+License: GPL-2+
+
+Files: listen/*
+Copyright: 1991, Phil Karn KA9Q <karn@qualcomm.com>
+ 1993, Jeff White N0POY <jwhite@white.nu>
+ 1996, Jonathan Naylor G4KLX <g4klx@g4klx.demon.co.uk>
+ 1996-1997 Heikki Hannikainen OH7LZB <oh7lzb@sral.fi>
+ 1996, Alan Cox GW4PTS <alan@cymru.net>
+ 1998, Jean-Paul Roubelat F6FBB <jpr@f6fbb.org>
+ 2001, Jeroen Vreeken PE1RXQ <pe1rxq@amsat.org>
+ 2003, Scott Miller N1VG <scott@n1vg.net>
+License: BSD-3-clause
+
+License: GPL-2+
+ This program is free software; you can redistribute it
+ and/or modify it under the terms of the GNU General Public
+ License as published by the Free Software Foundation; either
+ version 2 of the License, or (at your option) any later
+ version.
+ .
+ This program is distributed in the hope that it will be
+ useful, but WITHOUT ANY WARRANTY; without even the implied
+ warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+ PURPOSE.  See the GNU General Public License for more
+ details.
+ .
+ On Debian systems, the full text of the GNU General Public
+ License version 2 can be found in the file
+ `/usr/share/common-licenses/GPL-2'.
+
+License: Westerhof
+ Copyright 1991, Michael Westerhof, Sun Microsystems, Inc.
+ This software may be freely used, distributed, or modified, providing
+ this header is not removed.
+
+License: BSD-3-clause
+ This is free software, licensed under:
+ The (three-clause) BSD License
+ The BSD License
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions are
+ met:
+ * Redistributions of source code must retain the above copyright
+ notice, this list of conditions and the following disclaimer.
+ * Redistributions in binary form must reproduce the above copyright
+ notice, this list of conditions and the following disclaimer in the
+ documentation and/or other materials provided with the distribution.
+ * Neither the name of foo nor the names of its
+ contributors may be used to endorse or promote products derived from
+ this software without specific prior written permission.
+ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+ IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+ PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+ CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+ PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+ LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

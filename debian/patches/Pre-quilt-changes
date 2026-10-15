@@ -1,0 +1,19 @@
+From: Dave Hibberd <hibby@debian.org>
+Date: Tue, 16 Sep 2025 22:35:26 +0100
+Subject: Changes made before quilt
+
+Last-Update: 2024-02-24
+---
+ ax25ipd/ax25ipd.man | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ax25ipd/ax25ipd.man b/ax25ipd/ax25ipd.man
+index 3899244..ee2951d 100644
+--- a/ax25ipd/ax25ipd.man
++++ b/ax25ipd/ax25ipd.man
+@@ -1,4 +1,4 @@
+-.TH @@@AX25IPD@@@ 1 "12 September 2001" Linux "Linux Programmer's Manual"
++.TH @@@AX25IPD@@@ 8 "12 September 2001" Linux "Linux Programmer's Manual"
+ .SH NAME
+ @@@ax25ipd@@@ \- AX.25 into IP Encapsulator
+ .SH SYNOPSIS

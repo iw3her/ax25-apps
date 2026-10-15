@@ -1,0 +1,38 @@
+# Catalan translation of ax25-apps's debconf messages
+# Copyright © 2025 Free Software Foundation, Inc.
+# This file is distributed under the same license as the ax25-apps package.
+# Carles Pina i Estany <cpina@debian.org>, 2025.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: ax25-apps\n"
+"Report-Msgid-Bugs-To: ax25-apps@packages.debian.org\n"
+"POT-Creation-Date: 2010-04-18 19:15+0200\n"
+"PO-Revision-Date: 2025-02-04 16:30+0100\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Last-Translator: Carles Pina i Estany <cpina@debian.org>\n"
+"Language-Team: Catalan <debian-l10n-catalan@lists.debian.org>\n"
+"Language: ca\n"
+"X-Generator: Poedit 2.4.2\n"
+
+#. Type: boolean
+#. Description
+#: ../templates:1001
+msgid "Make listen setuid root?"
+msgstr "Voleu que el «listen» tingui el «setuid» de superusuari?"
+
+#. Type: boolean
+#. Description
+#: ../templates:1001
+msgid ""
+"The listen program needs to make calls as the root user.  One way of doing "
+"this is to make the program setuid root.  This is generally a bad idea as "
+"there are better ways, such as using the sudo program, to do this. However, "
+"you have the option of making it setuid root here if you like."
+msgstr ""
+"El programa «listen» ha de fer trucades com a usuari «root».  Una manera de "
+"fer-ho és posant-li el «setuid» de superusuari.  Això és generalment una mala "
+"idea, ja que hi ha millors maneres de fer-ho, com ara utilitzar el programa "
+"«sudo». No obstant això, teniu l'opció de posar-li el «setuid» aquí si voleu."
