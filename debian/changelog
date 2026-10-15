@@ -1,3 +1,13 @@
+ax25-apps (0.0.8-rc5+git20250922+f6c32b2+stackax25.1-1) UNRELEASED; urgency=medium
+
+  * Import the stackAX25 integration branch based on the 2025-09-22
+    LinuxHam snapshot.
+  * Drop Debian termio, spelling and time64 patches already included in
+    the source branch.
+  * Preserve the remaining Debian packaging and build through Autotools.
+
+ -- Lorenzo <iw3her.lorenzo@gmail.com>  Thu, 15 Oct 2026 00:00:00 +0200
+
 ax25-apps (0.0.8-rc5+git20230513+afc4a5f-4) unstable; urgency=medium
 
   * Patch termio -> termios

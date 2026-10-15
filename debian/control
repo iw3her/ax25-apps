@@ -4,7 +4,9 @@ Uploaders: Francois Marier <francois@debian.org>,
  	   Dave Hibberd <hibby@debian.org>
 Section: hamradio
 Priority: optional
-Build-Depends: debhelper-compat (= 13)
+Build-Depends: autoconf,
+               automake,
+               debhelper-compat (= 13)
 Build-Depends-Arch: libncurses-dev,
                libax25-dev,
                libtool

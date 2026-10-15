@@ -6,6 +6,7 @@ export DEB_BUILD_MAINT_OPTIONS=hardening=+all
 	dh $@
 
 override_dh_auto_configure:
+	autoreconf --install --force
 	dh_auto_configure -- --program-transform-name='s@^call@axcall@;s@^listen@axlisten@'
 
 override_dh_auto_install:
